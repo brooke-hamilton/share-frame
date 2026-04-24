@@ -1,10 +1,12 @@
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::geometry;
 
 const TIMER_ID: usize = 1;
+const FRAME_INTERVAL_MS: u32 = 33;
 
 pub struct CaptureState {
     pub timer_id: usize,
@@ -12,7 +14,6 @@ pub struct CaptureState {
     pub bitmap: HBITMAP,
     pub width: i32,
     pub height: i32,
-    pub frame_interval_ms: u32,
     pub capture_ok: bool,
 }
 
@@ -29,8 +30,7 @@ pub fn init(hwnd: HWND, width: i32, height: i32, dpi: u32) -> CaptureState {
         SelectObject(memory_dc, bitmap);
         ReleaseDC(None, screen_dc);
 
-        let frame_interval_ms = 33u32;
-        let timer_id = SetTimer(hwnd, TIMER_ID, frame_interval_ms, None);
+        let timer_id = SetTimer(hwnd, TIMER_ID, FRAME_INTERVAL_MS, None);
 
         CaptureState {
             timer_id,
@@ -38,23 +38,29 @@ pub fn init(hwnd: HWND, width: i32, height: i32, dpi: u32) -> CaptureState {
             bitmap,
             width: phys_w,
             height: phys_h,
-            frame_interval_ms,
             capture_ok: true,
         }
     }
 }
 
 /// Captures the desktop region behind the window.
-/// Sets alpha=0, BitBlts desktop, restores alpha=255, invalidates rect.
+/// Temporarily excludes the window from screen capture via display affinity
+/// so BitBlt does not pick up the window itself (avoids recursive self-capture).
+/// The window stays fully visible on the physical monitor — no flicker.
 pub fn capture_frame(hwnd: HWND, state: &mut CaptureState) -> bool {
     unsafe {
-        // Make window transparent so we capture what's behind it
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
+        // Hide from screen-capture APIs (Win10 2004+). The window stays visible
+        // on the physical display, so there is no user-visible flicker.
+        let _ = SetWindowDisplayAffinity(hwnd, WINDOW_DISPLAY_AFFINITY(0x11)); // WDA_EXCLUDEFROMCAPTURE
+
+        // Wait for DWM to composite a frame with the updated affinity so the
+        // subsequent BitBlt does not include this window.
+        let _ = DwmFlush();
 
         let desktop_dc = GetDC(None);
         if desktop_dc.is_invalid() {
             state.capture_ok = false;
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            let _ = SetWindowDisplayAffinity(hwnd, WINDOW_DISPLAY_AFFINITY(0)); // WDA_NONE
             let _ = InvalidateRect(hwnd, None, false);
             return false;
         }
@@ -77,8 +83,8 @@ pub fn capture_frame(hwnd: HWND, state: &mut CaptureState) -> bool {
 
         ReleaseDC(None, desktop_dc);
 
-        // Restore full opacity
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        // Restore normal affinity so Teams can capture the window content
+        let _ = SetWindowDisplayAffinity(hwnd, WINDOW_DISPLAY_AFFINITY(0)); // WDA_NONE
 
         state.capture_ok = ok.is_ok();
 

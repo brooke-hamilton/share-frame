@@ -159,6 +159,7 @@ pub fn logical_to_physical(logical: i32, dpi: u32) -> i32 {
 }
 
 /// Converts physical pixels to logical pixels for the given DPI.
+#[cfg(test)]
 pub fn physical_to_logical(physical: i32, dpi: u32) -> i32 {
     ((physical as i64 * 96) / dpi as i64) as i32
 }

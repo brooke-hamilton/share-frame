@@ -15,6 +15,7 @@ struct WindowState {
     capture: capture::CaptureState,
     dpi: u32,
     work_area: geometry::Rect,
+    in_size_move: bool,
 }
 
 const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
@@ -104,6 +105,7 @@ unsafe extern "system" fn wnd_proc(
                 capture: cap_state,
                 dpi,
                 work_area,
+                in_size_move: false,
             });
 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -129,7 +131,9 @@ unsafe extern "system" fn wnd_proc(
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !ptr.is_null() {
                 let state = &mut *ptr;
-                capture::capture_frame(hwnd, &mut state.capture);
+                if !state.in_size_move {
+                    capture::capture_frame(hwnd, &mut state.capture);
+                }
             }
             LRESULT(0)
         }
@@ -155,8 +159,39 @@ unsafe extern "system" fn wnd_proc(
                 let width = (lparam.0 & 0xFFFF) as i32;
                 let height = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 if width > 0 && height > 0 {
+                    if !state.in_size_move {
+                        capture::resize(&mut state.capture, width, height, state.dpi);
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_ENTERSIZEMOVE => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !ptr.is_null() {
+                let state = &mut *ptr;
+                state.in_size_move = true;
+            }
+            LRESULT(0)
+        }
+
+        WM_EXITSIZEMOVE => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !ptr.is_null() {
+                let state = &mut *ptr;
+                state.in_size_move = false;
+
+                // Resize bitmap to final dimensions, then recapture
+                let mut rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rect);
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
+                if width > 0 && height > 0 {
                     capture::resize(&mut state.capture, width, height, state.dpi);
                 }
+                capture::capture_frame(hwnd, &mut state.capture);
             }
             LRESULT(0)
         }
