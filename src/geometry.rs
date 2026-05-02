@@ -32,6 +32,18 @@ pub const HIT_TEST_MARGIN: i32 = 8;
 pub const MIN_WIDTH: i32 = 200;
 pub const MIN_HEIGHT: i32 = 150;
 
+// --- Title Bar Constants ---
+
+pub const TITLE_BAR_HEIGHT: i32 = 24;
+/// Close button width (square, same height as title bar)
+pub const CLOSE_BUTTON_WIDTH: i32 = 36;
+/// RGB(45, 45, 45) — dark title bar background
+pub const TITLE_BAR_COLOR: u32 = 45 | (45 << 8) | (45 << 16);
+/// RGB(200, 200, 200) — light text/icon color
+pub const TITLE_BAR_TEXT_COLOR: u32 = 200 | (200 << 8) | (200 << 16);
+/// RGB(232, 17, 35) — red close button hover background
+pub const CLOSE_BUTTON_HOVER_COLOR: u32 = 232 | (17 << 8) | (35 << 16);
+
 // --- Pure Functions ---
 
 /// Calculates the default window size for the given monitor dimensions (logical pixels).
@@ -106,8 +118,23 @@ pub fn hit_test(cursor: Point, window_rect: Rect, margin: i32, grip: i32) -> i32
         return HTBOTTOM as i32;
     }
 
+    // Close button in the title bar — return HTCLIENT so we receive mouse msgs
+    if y < top + TITLE_BAR_HEIGHT && x >= right - CLOSE_BUTTON_WIDTH {
+        return HTCLIENT as i32;
+    }
+
+    // Title bar area — return HTCAPTION for drag-to-move
+    if y < top + TITLE_BAR_HEIGHT {
+        return HTCAPTION as i32;
+    }
+
     // Interior — return HTCAPTION for drag-to-move
     HTCAPTION as i32
+}
+
+/// Returns true if the given client-relative point is inside the close button.
+pub fn is_in_close_button(client_x: i32, client_y: i32, client_width: i32) -> bool {
+    client_y < TITLE_BAR_HEIGHT && client_x >= client_width - CLOSE_BUTTON_WIDTH
 }
 
 /// Constrains a RECT to enforce minimum size during WM_SIZING.

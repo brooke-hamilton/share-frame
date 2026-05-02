@@ -4,6 +4,8 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture;
@@ -13,6 +15,8 @@ use crate::render;
 struct WindowState {
     capture: capture::CaptureState,
     work_area: geometry::Rect,
+    close_hovered: bool,
+    tracking_mouse: bool,
 }
 
 const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
@@ -56,7 +60,7 @@ pub fn create_and_run() -> windows::core::Result<()> {
             WS_EX_APPWINDOW | WS_EX_LAYERED,
             CLASS_NAME,
             WINDOW_TITLE,
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
             pos.x,
             pos.y,
             size.width,
@@ -98,11 +102,15 @@ unsafe extern "system" fn wnd_proc(
             let height = rect.bottom - rect.top;
 
             let work_area = geometry::get_monitor_work_area(hwnd);
-            let cap_state = capture::init(hwnd, width, height);
+            // Capture buffer covers only the content area below the title bar
+            let content_height = (height - geometry::TITLE_BAR_HEIGHT).max(1);
+            let cap_state = capture::init(hwnd, width, content_height);
 
             let state = Box::new(WindowState {
                 capture: cap_state,
                 work_area,
+                close_hovered: false,
+                tracking_mouse: false,
             });
 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -137,7 +145,7 @@ unsafe extern "system" fn wnd_proc(
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !ptr.is_null() {
                 let state = &*ptr;
-                render::paint(hwnd, &state.capture);
+                render::paint(hwnd, &state.capture, state.close_hovered);
             } else {
                 // No state yet, do default paint to avoid infinite WM_PAINT loop
                 let mut ps = PAINTSTRUCT::default();
@@ -157,8 +165,9 @@ unsafe extern "system" fn wnd_proc(
                 // StretchBlt.
                 let width = (lparam.0 & 0xFFFF) as i32;
                 let height = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                if width > 0 && height > 0 {
-                    capture::resize(&mut state.capture, width, height);
+                let content_height = height - geometry::TITLE_BAR_HEIGHT;
+                if width > 0 && content_height > 0 {
+                    capture::resize(&mut state.capture, width, content_height);
                     // Skip the immediate recapture while the user is dragging
                     // — paused captures will resume on WM_EXITSIZEMOVE. The
                     // stale frame is StretchBlt'd to the new size in the
@@ -298,9 +307,86 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_NCCALCSIZE => {
+            // Returning 0 with wParam TRUE tells the OS the entire window is
+            // client area (no non-client frame). This removes the visible
+            // thick frame that WS_THICKFRAME would normally draw, while
+            // keeping resize functionality active.
+            if wparam.0 != 0 {
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
         WM_ERASEBKGND => {
             // Return 1 to prevent background erase flicker
             LRESULT(1)
+        }
+
+        WM_MOUSEMOVE => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !ptr.is_null() {
+                let state = &mut *ptr;
+
+                // Request WM_MOUSELEAVE tracking if not already active
+                if !state.tracking_mouse {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                    state.tracking_mouse = true;
+                }
+
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+                let mut client_rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client_rect);
+                let cw = client_rect.right - client_rect.left;
+
+                let hovered = geometry::is_in_close_button(x, y, cw);
+                if hovered != state.close_hovered {
+                    state.close_hovered = hovered;
+                    // Invalidate just the title bar to repaint the close button
+                    let tb_rect = RECT { left: cw - geometry::CLOSE_BUTTON_WIDTH, top: 0, right: cw, bottom: geometry::TITLE_BAR_HEIGHT };
+                    let _ = InvalidateRect(hwnd, Some(&tb_rect), FALSE);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_MOUSELEAVE => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !ptr.is_null() {
+                let state = &mut *ptr;
+                state.tracking_mouse = false;
+                if state.close_hovered {
+                    state.close_hovered = false;
+                    let mut client_rect = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut client_rect);
+                    let cw = client_rect.right - client_rect.left;
+                    let tb_rect = RECT { left: cw - geometry::CLOSE_BUTTON_WIDTH, top: 0, right: cw, bottom: geometry::TITLE_BAR_HEIGHT };
+                    let _ = InvalidateRect(hwnd, Some(&tb_rect), FALSE);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_LBUTTONUP => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            let mut client_rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client_rect);
+            let cw = client_rect.right - client_rect.left;
+
+            if geometry::is_in_close_button(x, y, cw) {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
         }
 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

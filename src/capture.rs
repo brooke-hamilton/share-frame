@@ -97,6 +97,7 @@ pub fn capture_frame(hwnd: HWND, state: &mut CaptureState) -> bool {
         let mut win_rect = RECT::default();
         let _ = GetWindowRect(hwnd, &mut win_rect);
 
+        // Capture the screen area behind the content region (below the title bar)
         let ok = BitBlt(
             state.memory_dc,
             0,
@@ -105,7 +106,7 @@ pub fn capture_frame(hwnd: HWND, state: &mut CaptureState) -> bool {
             state.height,
             desktop_dc,
             win_rect.left,
-            win_rect.top,
+            win_rect.top + crate::geometry::TITLE_BAR_HEIGHT,
             SRCCOPY,
         );
 
