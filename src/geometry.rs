@@ -24,10 +24,8 @@ pub struct Rect {
 
 // --- BorderStyle Constants ---
 
-pub const BORDER_WIDTH: i32 = 3;
+pub const BORDER_WIDTH: i32 = 2;
 pub const GRIP_SIZE: i32 = 6;
-/// RGB(100, 100, 100) as a COLORREF (0x00BBGGRR)
-pub const BORDER_COLOR: u32 = 100 | (100 << 8) | (100 << 16);
 pub const HIT_TEST_MARGIN: i32 = 8;
 pub const MIN_WIDTH: i32 = 200;
 pub const MIN_HEIGHT: i32 = 150;
@@ -37,12 +35,35 @@ pub const MIN_HEIGHT: i32 = 150;
 pub const TITLE_BAR_HEIGHT: i32 = 24;
 /// Close button width (square, same height as title bar)
 pub const CLOSE_BUTTON_WIDTH: i32 = 36;
-/// RGB(45, 45, 45) — dark title bar background
-pub const TITLE_BAR_COLOR: u32 = 45 | (45 << 8) | (45 << 16);
-/// RGB(200, 200, 200) — light text/icon color
-pub const TITLE_BAR_TEXT_COLOR: u32 = 200 | (200 << 8) | (200 << 16);
 /// RGB(232, 17, 35) — red close button hover background
 pub const CLOSE_BUTTON_HOVER_COLOR: u32 = 232 | (17 << 8) | (35 << 16);
+
+// --- Theme Colors ---
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ThemeColors {
+    pub border: u32,
+    /// Border color when window is focused (accent color if enabled, otherwise same as border)
+    pub active_border: u32,
+    pub title_bar_bg: u32,
+    pub title_bar_text: u32,
+}
+
+/// Dark mode colors
+pub const DARK_THEME: ThemeColors = ThemeColors {
+    border: 100 | (100 << 8) | (100 << 16),          // RGB(100, 100, 100)
+    active_border: 100 | (100 << 8) | (100 << 16),   // same until accent overrides
+    title_bar_bg: 45 | (45 << 8) | (45 << 16),       // RGB(45, 45, 45)
+    title_bar_text: 200 | (200 << 8) | (200 << 16),  // RGB(200, 200, 200)
+};
+
+/// Light mode colors
+pub const LIGHT_THEME: ThemeColors = ThemeColors {
+    border: 160 | (160 << 8) | (160 << 16),           // RGB(160, 160, 160)
+    active_border: 160 | (160 << 8) | (160 << 16),    // same until accent overrides
+    title_bar_bg: 243 | (243 << 8) | (243 << 16),     // RGB(243, 243, 243)
+    title_bar_text: 30 | (30 << 8) | (30 << 16),      // RGB(30, 30, 30)
+};
 
 // --- Pure Functions ---
 

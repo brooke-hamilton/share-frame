@@ -2,8 +2,10 @@ use std::mem;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -17,10 +19,90 @@ struct WindowState {
     work_area: geometry::Rect,
     close_hovered: bool,
     tracking_mouse: bool,
+    focused: bool,
+    theme: geometry::ThemeColors,
 }
 
 const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
 const WINDOW_TITLE: PCWSTR = w!("Share Frame");
+
+/// Detects whether Windows is in dark mode by reading the registry.
+/// Returns the appropriate theme colors, with accent color override if enabled.
+fn detect_theme() -> geometry::ThemeColors {
+    unsafe {
+        let mut hkey = HKEY::default();
+        let subkey = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+        let result = RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &mut hkey);
+        if result.is_err() {
+            return geometry::DARK_THEME;
+        }
+
+        let value_name = w!("AppsUseLightTheme");
+        let mut data: u32 = 0;
+        let mut data_size = mem::size_of::<u32>() as u32;
+        let result = RegQueryValueExW(
+            hkey,
+            value_name,
+            None,
+            None,
+            Some(&mut data as *mut u32 as *mut u8),
+            Some(&mut data_size),
+        );
+        let _ = RegCloseKey(hkey);
+
+        if result.is_err() {
+            return geometry::DARK_THEME;
+        }
+
+        let mut theme = if data == 0 {
+            geometry::DARK_THEME
+        } else {
+            geometry::LIGHT_THEME
+        };
+
+        // Check if accent color on title bars/borders is enabled
+        let mut dwm_key = HKEY::default();
+        let dwm_subkey = w!("Software\\Microsoft\\Windows\\DWM");
+        let result = RegOpenKeyExW(HKEY_CURRENT_USER, dwm_subkey, 0, KEY_READ, &mut dwm_key);
+        if result.is_ok() {
+            let prevalence_name = w!("ColorPrevalence");
+            let mut prevalence: u32 = 0;
+            let mut prev_size = mem::size_of::<u32>() as u32;
+            let prev_result = RegQueryValueExW(
+                dwm_key,
+                prevalence_name,
+                None,
+                None,
+                Some(&mut prevalence as *mut u32 as *mut u8),
+                Some(&mut prev_size),
+            );
+
+            if prev_result.is_ok() && prevalence == 1 {
+                // Read the accent color (stored as 0xAABBGGRR)
+                let color_name = w!("AccentColor");
+                let mut accent: u32 = 0;
+                let mut color_size = mem::size_of::<u32>() as u32;
+                let color_result = RegQueryValueExW(
+                    dwm_key,
+                    color_name,
+                    None,
+                    None,
+                    Some(&mut accent as *mut u32 as *mut u8),
+                    Some(&mut color_size),
+                );
+
+                if color_result.is_ok() {
+                    // COLORREF is 0x00BBGGRR — mask out alpha byte
+                    // Only the active (focused) border uses accent color
+                    theme.active_border = accent & 0x00FFFFFF;
+                }
+            }
+            let _ = RegCloseKey(dwm_key);
+        }
+
+        theme
+    }
+}
 
 /// Creates the window and runs the Win32 message loop.
 pub fn create_and_run() -> windows::core::Result<()> {
@@ -111,12 +193,23 @@ unsafe extern "system" fn wnd_proc(
                 work_area,
                 close_hovered: false,
                 tracking_mouse: false,
+                focused: true,
+                theme: detect_theme(),
             });
 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
             // Set initial layered window alpha to fully opaque
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+
+            // Request rounded corners (Windows 11+). Silently ignored on older OS.
+            let preference = DWMWCP_ROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &preference as *const _ as *const _,
+                mem::size_of_val(&preference) as u32,
+            );
 
             LRESULT(0)
         }
@@ -145,7 +238,7 @@ unsafe extern "system" fn wnd_proc(
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !ptr.is_null() {
                 let state = &*ptr;
-                render::paint(hwnd, &state.capture, state.close_hovered);
+                render::paint(hwnd, &state.capture, state.close_hovered, state.focused, state.theme);
             } else {
                 // No state yet, do default paint to avoid infinite WM_PAINT loop
                 let mut ps = PAINTSTRUCT::default();
@@ -316,6 +409,33 @@ unsafe extern "system" fn wnd_proc(
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        WM_ACTIVATE => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !ptr.is_null() {
+                let state = &mut *ptr;
+                let active = (wparam.0 & 0xFFFF) != 0; // WA_INACTIVE = 0
+                if active != state.focused {
+                    state.focused = active;
+                    let _ = InvalidateRect(hwnd, None, FALSE);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_SETTINGCHANGE => {
+            // Detect theme change (dark/light mode toggle)
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !ptr.is_null() {
+                let state = &mut *ptr;
+                let new_theme = detect_theme();
+                if new_theme != state.theme {
+                    state.theme = new_theme;
+                    let _ = InvalidateRect(hwnd, None, FALSE);
+                }
+            }
+            LRESULT(0)
         }
 
         WM_ERASEBKGND => {
