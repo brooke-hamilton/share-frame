@@ -7,15 +7,25 @@ use crate::capture::CaptureState;
 use crate::geometry;
 
 /// Paints captured content, title bar, and border onto the window. Called during WM_PAINT.
+/// Uses double-buffering: composes the full frame to an offscreen DC, then
+/// blits it to the screen in a single
+///
+/// operation to eliminate flicker.
 pub fn paint(hwnd: HWND, state: &CaptureState, close_button_hovered: bool, focused: bool, theme: geometry::ThemeColors) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
+        let screen_hdc = BeginPaint(hwnd, &mut ps);
 
         let mut client_rect = RECT::default();
         let _ = GetClientRect(hwnd, &mut client_rect);
         let cw = client_rect.right - client_rect.left;
         let ch = client_rect.bottom - client_rect.top;
+
+        // Create offscreen buffer for flicker-free compositing
+        let buf_dc = CreateCompatibleDC(screen_hdc);
+        let buf_bmp = CreateCompatibleBitmap(screen_hdc, cw, ch);
+        let old_bmp = SelectObject(buf_dc, buf_bmp);
+        let hdc = buf_dc;
 
         let tb_height = geometry::TITLE_BAR_HEIGHT;
 
@@ -150,6 +160,14 @@ pub fn paint(hwnd: HWND, state: &CaptureState, close_button_hovered: bool, focus
         }
 
         let _ = DeleteObject(border_brush);
+
+        // Blit the composed frame to the screen in one operation
+        let _ = BitBlt(screen_hdc, 0, 0, cw, ch, buf_dc, 0, 0, SRCCOPY);
+
+        // Clean up offscreen buffer
+        SelectObject(buf_dc, old_bmp);
+        let _ = DeleteObject(buf_bmp);
+        let _ = DeleteDC(buf_dc);
 
         let _ = EndPaint(hwnd, &ps);
     }
