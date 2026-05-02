@@ -58,6 +58,63 @@ pub fn paint(hwnd: HWND, state: &CaptureState, close_button_hovered: bool, focus
             let _ = DeleteObject(error_brush);
         }
 
+        // --- Grid Overlay (subtle visual cue that overlay is present) ---
+        let content_height = ch - tb_height;
+        if content_height > 0 && cw > 0 {
+            let grid_dc = CreateCompatibleDC(hdc);
+            let grid_bmp = CreateCompatibleBitmap(hdc, cw, content_height);
+            let old_grid_bmp = SelectObject(grid_dc, grid_bmp);
+
+            // Fill with black background
+            let black_brush = CreateSolidBrush(COLORREF(0x00000000));
+            let grid_rect = RECT { left: 0, top: 0, right: cw, bottom: content_height };
+            FillRect(grid_dc, &grid_rect, black_brush);
+            let _ = DeleteObject(black_brush);
+
+            // Draw white grid lines every 48px
+            let white_pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FFFFFF));
+            let old_pen = SelectObject(grid_dc, white_pen);
+
+            let grid_spacing = 48;
+
+            // Vertical lines
+            let mut x = grid_spacing;
+            while x < cw {
+                let _ = MoveToEx(grid_dc, x, 0, None);
+                let _ = LineTo(grid_dc, x, content_height);
+                x += grid_spacing;
+            }
+
+            // Horizontal lines
+            let mut y = grid_spacing;
+            while y < content_height {
+                let _ = MoveToEx(grid_dc, 0, y, None);
+                let _ = LineTo(grid_dc, cw, y);
+                y += grid_spacing;
+            }
+
+            SelectObject(grid_dc, old_pen);
+            let _ = DeleteObject(white_pen);
+
+            // AlphaBlend the grid over content area at ~10% opacity
+            let blend_fn = BLENDFUNCTION {
+                BlendOp: 0,              // AC_SRC_OVER
+                BlendFlags: 0,
+                SourceConstantAlpha: 25, // ~10% visibility
+                AlphaFormat: 0,
+            };
+            let _ = AlphaBlend(
+                hdc, 0, tb_height, cw, content_height,
+                grid_dc, 0, 0, cw, content_height,
+                blend_fn,
+            );
+
+            // Clean up grid resources
+            SelectObject(grid_dc, old_grid_bmp);
+            let _ = DeleteObject(grid_bmp);
+            let _ = DeleteDC(grid_dc);
+        }
+
         // --- Title Bar ---
         let title_bar_brush = CreateSolidBrush(COLORREF(theme.title_bar_bg));
         let title_bar_rect = RECT { left: 0, top: 0, right: cw, bottom: tb_height };
