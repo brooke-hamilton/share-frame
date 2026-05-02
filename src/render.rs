@@ -20,6 +20,9 @@ pub fn paint(hwnd: HWND, state: &CaptureState) {
             // If physical capture size differs from logical client size, use StretchBlt
             if state.width != cw || state.height != ch {
                 SetStretchBltMode(hdc, HALFTONE);
+                // MSDN: after switching to HALFTONE the application must call
+                // SetBrushOrgEx to avoid brush misalignment artifacts.
+                let _ = SetBrushOrgEx(hdc, 0, 0, None);
                 let _ = StretchBlt(
                     hdc,
                     0,
@@ -43,17 +46,28 @@ pub fn paint(hwnd: HWND, state: &CaptureState) {
             let _ = DeleteObject(error_brush);
         }
 
-        // Draw 3px border
+        // Draw the border as four FillRect strips along the inside edges of
+        // the client area. Using Rectangle() with a 3px pen would clip the
+        // right and bottom edges (the pen path runs at x=cw / y=ch, outside
+        // the client rect) and produce visibly uneven borders.
         let border_brush = CreateSolidBrush(COLORREF(geometry::BORDER_COLOR));
-        let border_pen = CreatePen(PS_SOLID, geometry::BORDER_WIDTH, COLORREF(geometry::BORDER_COLOR));
-        let old_pen = SelectObject(hdc, border_pen);
-        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = Rectangle(hdc, 0, 0, cw, ch);
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-        let _ = DeleteObject(border_pen);
+        let bw = geometry::BORDER_WIDTH;
+        let edges = [
+            // Top
+            RECT { left: 0, top: 0, right: cw, bottom: bw },
+            // Bottom
+            RECT { left: 0, top: ch - bw, right: cw, bottom: ch },
+            // Left
+            RECT { left: 0, top: 0, right: bw, bottom: ch },
+            // Right
+            RECT { left: cw - bw, top: 0, right: cw, bottom: ch },
+        ];
+        for r in &edges {
+            FillRect(hdc, r, border_brush);
+        }
 
-        // Draw 6px corner grip squares
+        // Draw 6px corner grip squares using the same brush so they overpaint
+        // the border crisply at the corners.
         let grip = geometry::GRIP_SIZE;
         let grip_rects = [
             // Top-left

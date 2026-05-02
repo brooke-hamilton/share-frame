@@ -35,12 +35,17 @@ pub const MIN_HEIGHT: i32 = 150;
 // --- Pure Functions ---
 
 /// Calculates the default window size for the given monitor dimensions (logical pixels).
-/// Returns min(1920, monitor_width * 75/100) with 16:9 aspect ratio.
+/// Returns min(1920, monitor_width * 75/100) with a 16:9 aspect ratio. If the
+/// 16:9 height would exceed 75% of monitor height (tall/narrow monitors), the
+/// width is recomputed from the height-clamped value so the result stays 16:9.
 pub fn default_size(monitor_width: i32, monitor_height: i32) -> Size {
-    let width = std::cmp::min(1920, monitor_width * 75 / 100);
-    let height = width * 9 / 16;
-    // Clamp height to monitor if needed
-    let height = std::cmp::min(height, monitor_height * 75 / 100);
+    let mut width = std::cmp::min(1920, monitor_width * 75 / 100);
+    let mut height = width * 9 / 16;
+    let max_height = monitor_height * 75 / 100;
+    if height > max_height {
+        height = max_height;
+        width = height * 16 / 9;
+    }
     Size { width, height }
 }
 
@@ -153,9 +158,19 @@ pub fn constrain_position(rect: &mut Rect, work_area: Rect) {
     }
 }
 
-/// Converts logical pixels to physical pixels for the given DPI.
+/// Converts logical pixels to physical pixels for the given DPI (rounded).
+#[cfg(test)]
 pub fn logical_to_physical(logical: i32, dpi: u32) -> i32 {
-    ((logical as i64 * dpi as i64) / 96) as i32
+    let dpi = dpi as i64;
+    let logical = logical as i64;
+    // Round to nearest, away from zero, instead of truncating toward zero.
+    let scaled = logical * dpi;
+    let rounded = if scaled >= 0 {
+        (scaled + 48) / 96
+    } else {
+        (scaled - 48) / 96
+    };
+    rounded as i32
 }
 
 /// Converts physical pixels to logical pixels for the given DPI.
@@ -171,7 +186,7 @@ pub fn get_monitor_work_area(hwnd: windows::Win32::Foundation::HWND) -> Rect {
     use windows::Win32::Graphics::Gdi::*;
 
     unsafe {
-        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()

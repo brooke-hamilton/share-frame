@@ -4,7 +4,6 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture;
@@ -13,7 +12,6 @@ use crate::render;
 
 struct WindowState {
     capture: capture::CaptureState,
-    dpi: u32,
     work_area: geometry::Rect,
 }
 
@@ -32,7 +30,10 @@ pub fn create_and_run() -> windows::core::Result<()> {
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: HBRUSH::default(), // No background brush
+            // Use a NULL stock brush rather than a default (null) HBRUSH so
+            // DefWindowProc never tries to FillRect with an invalid handle if
+            // a future code path forgets to handle WM_ERASEBKGND.
+            hbrBackground: HBRUSH(GetStockObject(NULL_BRUSH).0),
             ..Default::default()
         };
 
@@ -89,20 +90,18 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_CREATE => {
-            let dpi = GetDpiForWindow(hwnd);
-            let dpi = if dpi == 0 { 96 } else { dpi };
-
             let mut rect = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rect);
+            // GetWindowRect on a per-monitor DPI-aware window already returns
+            // physical pixels — pass them straight through to capture::init.
             let width = rect.right - rect.left;
             let height = rect.bottom - rect.top;
 
             let work_area = geometry::get_monitor_work_area(hwnd);
-            let cap_state = capture::init(hwnd, width, height, dpi);
+            let cap_state = capture::init(hwnd, width, height);
 
             let state = Box::new(WindowState {
                 capture: cap_state,
-                dpi,
                 work_area,
             });
 
@@ -152,12 +151,42 @@ unsafe extern "system" fn wnd_proc(
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !ptr.is_null() {
                 let state = &mut *ptr;
+                // lParam holds the new client size in physical pixels for a
+                // per-monitor DPI-aware window. Resize the back buffer to
+                // match exactly so paint() can use BitBlt (1:1) instead of
+                // StretchBlt.
                 let width = (lparam.0 & 0xFFFF) as i32;
                 let height = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 if width > 0 && height > 0 {
-                    capture::resize(&mut state.capture, width, height, state.dpi);
-                    capture::capture_frame(hwnd, &mut state.capture);
+                    capture::resize(&mut state.capture, width, height);
+                    // Skip the immediate recapture while the user is dragging
+                    // — paused captures will resume on WM_EXITSIZEMOVE. The
+                    // stale frame is StretchBlt'd to the new size in the
+                    // meantime, which is what the user expects to see.
+                    if !state.capture.paused {
+                        capture::capture_frame(hwnd, &mut state.capture);
+                    }
                 }
+            }
+            LRESULT(0)
+        }
+
+        WM_ENTERSIZEMOVE => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !ptr.is_null() {
+                (*ptr).capture.paused = true;
+            }
+            LRESULT(0)
+        }
+
+        WM_EXITSIZEMOVE => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !ptr.is_null() {
+                let state = &mut *ptr;
+                state.capture.paused = false;
+                // Refresh after the user finishes dragging so the displayed
+                // frame matches the new geometry.
+                capture::capture_frame(hwnd, &mut state.capture);
             }
             LRESULT(0)
         }
@@ -213,11 +242,10 @@ unsafe extern "system" fn wnd_proc(
         }
 
         WM_DPICHANGED => {
-            let new_dpi = (wparam.0 & 0xFFFF) as u32;
+            let _new_dpi = (wparam.0 & 0xFFFF) as u32;
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
-                state.dpi = new_dpi;
                 state.work_area = geometry::get_monitor_work_area(hwnd);
             }
 
