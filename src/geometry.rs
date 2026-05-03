@@ -117,6 +117,26 @@ pub fn physical_to_logical(physical: i32, dpi: u32) -> i32 {
 
 // --- Win32-Dependent Functions ---
 
+/// Returns the width of DWM-drawn caption buttons (close + maximize +
+/// disabled minimize), falling back to a constant if the API is unavailable.
+pub unsafe fn caption_buttons_width(hwnd: windows::Win32::Foundation::HWND) -> i32 {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::*;
+
+    let mut buttons_rect = RECT::default();
+    let result = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CAPTION_BUTTON_BOUNDS,
+        &mut buttons_rect as *mut _ as *mut _,
+        std::mem::size_of::<RECT>() as u32,
+    );
+    if result.is_ok() {
+        buttons_rect.right - buttons_rect.left
+    } else {
+        DEFAULT_CAPTION_BUTTONS_WIDTH
+    }
+}
+
 /// Gets the work area for the monitor containing the given window.
 pub fn get_monitor_work_area(hwnd: windows::Win32::Foundation::HWND) -> Rect {
     use windows::Win32::Graphics::Gdi::*;

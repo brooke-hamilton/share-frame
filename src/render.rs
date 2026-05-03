@@ -1,6 +1,5 @@
 use windows::core::w;
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -9,13 +8,10 @@ use crate::geometry;
 
 // --- Render constants ---
 
-/// Title-bar background — black; DWM treats this as glass once the alpha
-/// channel is set to 255.
-const TITLE_BAR_COLOR: COLORREF = COLORREF(0x00000000);
-/// Hover background for the "Send to Back" button.
-const SEND_BACK_HOVER_COLOR: COLORREF = COLORREF(0x00333333);
-/// Title-bar text color.
-const TEXT_COLOR: COLORREF = COLORREF(0x00FFFFFF);
+/// Background fill for the captured-content region (under the grid overlay).
+/// DWM glass is unaffected because the title bar uses [`TitleBarTheme`]
+/// colors instead.
+const CONTENT_BG_COLOR: COLORREF = COLORREF(0x00000000);
 /// Grid-line color drawn over the captured frame.
 const GRID_LINE_COLOR: COLORREF = COLORREF(0x00FFFFFF);
 /// Fallback fill when capture fails (dark red).
@@ -30,6 +26,16 @@ const WINDOW_TITLE_LEN: usize = WINDOW_TITLE.len();
 const _: () = assert!(WINDOW_TITLE.is_ascii(), "WINDOW_TITLE must be ASCII");
 /// Source-over blend op for `BLENDFUNCTION::BlendOp`.
 const AC_SRC_OVER: u8 = 0x00;
+
+/// Colors used to paint the custom title bar. Computed from the active
+/// Windows theme and DWM accent settings each paint so it matches whatever
+/// DWM draws in the caption-buttons strip on the right.
+#[derive(Copy, Clone)]
+pub struct TitleBarTheme {
+    pub background: COLORREF,
+    pub text: COLORREF,
+    pub hover: COLORREF,
+}
 
 /// Cached per-DPI fonts used to draw the custom title bar.
 struct CachedFonts {
@@ -94,6 +100,7 @@ pub fn paint(
     send_back_hovered: bool,
     title_bar_height: i32,
     dpi: u32,
+    theme: TitleBarTheme,
 ) {
     // SAFETY: Standard GDI paint sequence; all created handles are released
     // before `EndPaint` returns.
@@ -143,6 +150,7 @@ pub fn paint(
             send_back_hovered,
             dpi,
             hwnd,
+            theme,
         );
 
         fix_title_bar_alpha(bits_ptr, cw, title_bar_height, caption_buttons_width);
@@ -173,11 +181,12 @@ unsafe fn paint_title_bar(
     send_back_hovered: bool,
     dpi: u32,
     hwnd: HWND,
+    theme: TitleBarTheme,
 ) {
     fill_solid(
         hdc,
         RECT { left: 0, top: 0, right: cw, bottom: tb_height },
-        TITLE_BAR_COLOR,
+        theme.background,
     );
 
     let (button_left, button_right) =
@@ -192,7 +201,7 @@ unsafe fn paint_title_bar(
                 right: button_right,
                 bottom: tb_height,
             },
-            SEND_BACK_HOVER_COLOR,
+            theme.hover,
         );
     }
 
@@ -220,7 +229,7 @@ unsafe fn paint_title_bar(
     // Window title text.
     let text_left = icon_x + icon_size + 8;
     let old_font = SelectObject(hdc, fonts.title_font);
-    SetTextColor(hdc, TEXT_COLOR);
+    SetTextColor(hdc, theme.text);
     SetBkMode(hdc, TRANSPARENT);
     let mut title_text = title_text_buffer();
     let mut title_rect = RECT {
@@ -239,7 +248,7 @@ unsafe fn paint_title_bar(
 
     // "Send to Back" glyph.
     let old_font = SelectObject(hdc, fonts.icon_font);
-    SetTextColor(hdc, TEXT_COLOR);
+    SetTextColor(hdc, theme.text);
     let mut glyph = [SEND_BACK_GLYPH];
     let mut glyph_rect = RECT {
         left: button_left,
@@ -329,7 +338,7 @@ unsafe fn paint_grid_overlay(hdc: HDC, cw: i32, content_height: i32, tb_height: 
     fill_solid(
         grid_dc,
         RECT { left: 0, top: 0, right: cw, bottom: content_height },
-        TITLE_BAR_COLOR,
+        CONTENT_BG_COLOR,
     );
 
     let pen = CreatePen(PS_SOLID, 1, GRID_LINE_COLOR);
@@ -416,16 +425,5 @@ fn title_text_buffer() -> [u16; WINDOW_TITLE_LEN] {
 /// Returns the width of DWM-drawn caption buttons, falling back to a sensible
 /// constant if the API is unavailable.
 unsafe fn caption_buttons_width(hwnd: HWND) -> i32 {
-    let mut buttons_rect = RECT::default();
-    let result = DwmGetWindowAttribute(
-        hwnd,
-        DWMWA_CAPTION_BUTTON_BOUNDS,
-        &mut buttons_rect as *mut _ as *mut _,
-        std::mem::size_of::<RECT>() as u32,
-    );
-    if result.is_ok() {
-        buttons_rect.right - buttons_rect.left
-    } else {
-        geometry::DEFAULT_CAPTION_BUTTONS_WIDTH
-    }
+    geometry::caption_buttons_width(hwnd)
 }

@@ -13,7 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::CaptureState;
 use crate::geometry;
-use crate::render::{self, RenderCache};
+use crate::render::{self, RenderCache, TitleBarTheme};
 
 /// Per-window state. Owned via `Box` and stored in `GWLP_USERDATA`.
 struct WindowState {
@@ -27,36 +27,104 @@ struct WindowState {
 const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
 const WINDOW_TITLE: PCWSTR = w!("Share Frame");
 
-/// Detects whether Windows is in dark mode by reading the registry.
-/// Defaults to `false` (light mode, matching the Windows default) when the
-/// value cannot be read.
-fn is_dark_mode() -> bool {
-    // SAFETY: All registry handles opened here are closed before return.
+/// Reads a `REG_DWORD` from `HKEY_CURRENT_USER\<subkey>\<value>`.
+/// Returns `None` if the key/value is missing or unreadable.
+fn read_hkcu_dword(subkey: PCWSTR, value: PCWSTR) -> Option<u32> {
+    // SAFETY: Registry handle is closed before return.
     unsafe {
         let mut hkey = HKEY::default();
-        let subkey = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
         if RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &mut hkey).is_err() {
-            return false;
+            return None;
         }
-
-        let value_name = w!("AppsUseLightTheme");
         let mut data: u32 = 0;
         let mut data_size = mem::size_of::<u32>() as u32;
         let result = RegQueryValueExW(
             hkey,
-            value_name,
+            value,
             None,
             None,
             Some(&mut data as *mut u32 as *mut u8),
             Some(&mut data_size),
         );
         let _ = RegCloseKey(hkey);
-
-        if result.is_err() {
-            return false;
-        }
-        data == 0
+        if result.is_err() { None } else { Some(data) }
     }
+}
+
+/// Detects whether Windows is in dark mode by reading the registry.
+/// Defaults to `false` (light mode, matching the Windows default) when the
+/// value cannot be read.
+fn is_dark_mode() -> bool {
+    read_hkcu_dword(
+        w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+        w!("AppsUseLightTheme"),
+    ) == Some(0)
+}
+
+/// Returns `true` when the user has enabled "Show accent color on title bars
+/// and window borders" in Windows Personalization settings. DWM then paints
+/// the caption-buttons strip with the accent color, so the rest of our
+/// custom title bar must match.
+fn color_prevalence() -> bool {
+    read_hkcu_dword(w!("Software\\Microsoft\\Windows\\DWM"), w!("ColorPrevalence"))
+        == Some(1)
+}
+
+/// Computes the current title-bar color scheme from the system theme,
+/// accent-color setting, and DWM colorization color so our custom title bar
+/// matches whatever DWM paints in the caption-buttons strip.
+fn current_title_bar_theme() -> TitleBarTheme {
+    let dark = is_dark_mode();
+
+    if color_prevalence() {
+        // SAFETY: Out parameters are local stack values.
+        let mut color: u32 = 0;
+        let mut opaque = BOOL(0);
+        let ok = unsafe { DwmGetColorizationColor(&mut color, &mut opaque) }.is_ok();
+        if ok {
+            // `color` is 0xAARRGGBB; COLORREF is 0x00BBGGRR.
+            let r = ((color >> 16) & 0xFF) as u8;
+            let g = ((color >> 8) & 0xFF) as u8;
+            let b = (color & 0xFF) as u8;
+            let bg = COLORREF(
+                (r as u32) | ((g as u32) << 8) | ((b as u32) << 16),
+            );
+            // Use perceived luminance to pick a legible foreground.
+            let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+            let (text, hover) = if lum > 140.0 {
+                (COLORREF(0x00000000), tint_color(r, g, b, -32))
+            } else {
+                (COLORREF(0x00FFFFFF), tint_color(r, g, b, 32))
+            };
+            return TitleBarTheme { background: bg, text, hover };
+        }
+    }
+
+    if dark {
+        TitleBarTheme {
+            background: COLORREF(0x00000000),
+            text: COLORREF(0x00FFFFFF),
+            hover: COLORREF(0x00333333),
+        }
+    } else {
+        TitleBarTheme {
+            background: COLORREF(0x00FFFFFF),
+            text: COLORREF(0x00000000),
+            hover: COLORREF(0x00CCCCCC),
+        }
+    }
+}
+
+/// Lightens (positive `delta`) or darkens (negative `delta`) the given
+/// RGB color and returns it as a `COLORREF` (0x00BBGGRR).
+fn tint_color(r: u8, g: u8, b: u8, delta: i32) -> COLORREF {
+    let adjust = |c: u8| -> u8 {
+        (c as i32 + delta).clamp(0, 255) as u8
+    };
+    let r = adjust(r) as u32;
+    let g = adjust(g) as u32;
+    let b = adjust(b) as u32;
+    COLORREF(r | (g << 8) | (b << 16))
 }
 
 /// Creates the window and runs the Win32 message loop.
@@ -294,6 +362,12 @@ unsafe extern "system" fn wnd_proc(
             let _ = InvalidateRect(hwnd, None, FALSE);
             LRESULT(0)
         }
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            // Accent color or its prevalence flag changed; repaint so our
+            // custom title bar background tracks the DWM-painted strip.
+            let _ = InvalidateRect(hwnd, None, FALSE);
+            LRESULT(0)
+        }
         WM_ERASEBKGND => LRESULT(1),
         WM_MOUSEMOVE => on_mouse_move(hwnd, lparam),
         WM_MOUSELEAVE => on_mouse_leave(hwnd),
@@ -349,6 +423,7 @@ unsafe fn on_timer(hwnd: HWND) -> LRESULT {
 
 unsafe fn on_paint(hwnd: HWND) -> LRESULT {
     let dpi = GetDpiForWindow(hwnd);
+    let theme = current_title_bar_theme();
     let painted = with_state(hwnd, |state| {
         render::paint(
             hwnd,
@@ -357,6 +432,7 @@ unsafe fn on_paint(hwnd: HWND) -> LRESULT {
             state.send_back_hovered,
             state.title_bar_height,
             dpi,
+            theme,
         );
     });
     if painted.is_none() {
@@ -575,16 +651,5 @@ unsafe fn find_topmost_app_window(exclude: HWND) -> Option<HWND> {
 /// Returns the width of DWM-drawn caption buttons (close + maximize +
 /// disabled minimize), falling back to a constant if the API fails.
 unsafe fn caption_buttons_width(hwnd: HWND) -> i32 {
-    let mut buttons_rect = RECT::default();
-    let result = DwmGetWindowAttribute(
-        hwnd,
-        DWMWA_CAPTION_BUTTON_BOUNDS,
-        &mut buttons_rect as *mut _ as *mut _,
-        mem::size_of::<RECT>() as u32,
-    );
-    if result.is_ok() {
-        buttons_rect.right - buttons_rect.left
-    } else {
-        geometry::DEFAULT_CAPTION_BUTTONS_WIDTH
-    }
+    geometry::caption_buttons_width(hwnd)
 }
