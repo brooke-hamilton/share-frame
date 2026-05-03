@@ -97,7 +97,11 @@ pub fn capture_frame(hwnd: HWND, state: &mut CaptureState) -> bool {
         let mut win_rect = RECT::default();
         let _ = GetWindowRect(hwnd, &mut win_rect);
 
-        // Capture the screen area behind the content region (below the title bar)
+        // Get client area origin in screen coordinates
+        let mut client_origin = POINT { x: 0, y: 0 };
+        let _ = ClientToScreen(hwnd, &mut client_origin);
+
+        // Capture the screen area behind the client region
         let ok = BitBlt(
             state.memory_dc,
             0,
@@ -105,8 +109,8 @@ pub fn capture_frame(hwnd: HWND, state: &mut CaptureState) -> bool {
             state.width,
             state.height,
             desktop_dc,
-            win_rect.left,
-            win_rect.top + crate::geometry::TITLE_BAR_HEIGHT,
+            client_origin.x,
+            client_origin.y,
             SRCCOPY,
         );
 
