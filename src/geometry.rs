@@ -25,6 +25,11 @@ pub struct Rect {
 pub const MIN_WIDTH: i32 = 200;
 pub const MIN_HEIGHT: i32 = 150;
 
+/// Width of the custom "Send to Back" button in the title bar.
+pub const SEND_BACK_BUTTON_WIDTH: i32 = 46;
+/// Resize border width for hit testing.
+pub const RESIZE_MARGIN: i32 = 8;
+
 // --- Pure Functions ---
 
 /// Calculates the default window size for the given monitor dimensions (logical pixels).

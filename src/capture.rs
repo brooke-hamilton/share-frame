@@ -1,6 +1,7 @@
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const TIMER_ID: usize = 1;
@@ -97,11 +98,17 @@ pub fn capture_frame(hwnd: HWND, state: &mut CaptureState) -> bool {
         let mut win_rect = RECT::default();
         let _ = GetWindowRect(hwnd, &mut win_rect);
 
-        // Get client area origin in screen coordinates
+        // Get client area origin in screen coordinates, offset by title bar
         let mut client_origin = POINT { x: 0, y: 0 };
         let _ = ClientToScreen(hwnd, &mut client_origin);
+        let dpi = GetDpiForWindow(hwnd);
+        let frame_y = GetSystemMetricsForDpi(SM_CYFRAME, dpi);
+        let caption = GetSystemMetricsForDpi(SM_CYCAPTION, dpi);
+        let padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+        let title_bar_height = frame_y + caption + padding;
+        client_origin.y += title_bar_height;
 
-        // Capture the screen area behind the client region
+        // Capture the screen area behind the content region (below the title bar)
         let ok = BitBlt(
             state.memory_dc,
             0,
