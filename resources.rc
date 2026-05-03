@@ -1,0 +1,2 @@
+// Application icon — ID 1 is the default icon Windows uses for the exe.
+1 ICON "assets\\icons\\share-frame.ico"

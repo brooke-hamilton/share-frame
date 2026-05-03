@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Concept 3: Two overlapping frames (depth) with share arrow -->
+  <!-- Back frame (offset, lighter) -->
+  <rect x="32" y="16" width="80" height="72" rx="6" ry="6"
+        fill="#DBEAFE" stroke="#93C5FD" stroke-width="3"/>
+  <!-- Back frame title bar -->
+  <rect x="32" y="16" width="80" height="16" rx="6" ry="0"
+        fill="#93C5FD"/>
+  <!-- Front frame (main, darker) -->
+  <rect x="16" y="36" width="80" height="72" rx="6" ry="6"
+        fill="#EFF6FF" stroke="#3B82F6" stroke-width="4"/>
+  <!-- Front frame title bar -->
+  <rect x="16" y="36" width="80" height="16" rx="6" ry="0"
+        fill="#3B82F6"/>
+  <!-- Share arrow in front frame content area -->
+  <line x1="56" y1="62" x2="56" y2="96" stroke="#1E40AF" stroke-width="5" stroke-linecap="round"/>
+  <polyline points="42,76 56,62 70,76" fill="none" stroke="#1E40AF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

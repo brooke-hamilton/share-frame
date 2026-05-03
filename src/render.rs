@@ -1,7 +1,7 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, GetClientRect, HICON, DI_NORMAL};
 
 use crate::capture::CaptureState;
 use crate::geometry;
@@ -11,7 +11,7 @@ use crate::geometry;
 /// blits it to the screen in a single
 ///
 /// operation to eliminate flicker.
-pub fn paint(hwnd: HWND, state: &CaptureState, close_button_hovered: bool, focused: bool, theme: geometry::ThemeColors) {
+pub fn paint(hwnd: HWND, state: &CaptureState, close_button_hovered: bool, focused: bool, theme: geometry::ThemeColors, icon: HICON) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let screen_hdc = BeginPaint(hwnd, &mut ps);
@@ -121,7 +121,16 @@ pub fn paint(hwnd: HWND, state: &CaptureState, close_button_hovered: bool, focus
         FillRect(hdc, &title_bar_rect, title_bar_brush);
         let _ = DeleteObject(title_bar_brush);
 
-        // Draw title text
+        // Draw icon in title bar (left side, vertically centered)
+        let icon_size = 16;
+        let icon_x = 4;
+        let icon_y = (tb_height - icon_size) / 2;
+        if icon != HICON::default() {
+            let _ = DrawIconEx(hdc, icon_x, icon_y, icon, icon_size, icon_size, 0, None, DI_NORMAL);
+        }
+
+        // Draw title text (offset right to make room for icon)
+        let text_left = icon_x + icon_size + 4;
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, COLORREF(theme.title_bar_text));
         let title_font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
@@ -137,9 +146,9 @@ pub fn paint(hwnd: HWND, state: &CaptureState, close_button_hovered: bool, focus
             PCWSTR(title_font_name.as_ptr()),
         );
         let old_title_font = SelectObject(hdc, title_font);
-        let mut text_rect = RECT { left: 0, top: 0, right: cw, bottom: tb_height };
+        let mut text_rect = RECT { left: text_left, top: 0, right: cw - geometry::CLOSE_BUTTON_WIDTH, bottom: tb_height };
         let title: Vec<u16> = "Share Frame".encode_utf16().collect();
-        DrawTextW(hdc, &mut title.clone(), &mut text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(hdc, &mut title.clone(), &mut text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old_title_font);
         let _ = DeleteObject(title_font);
 

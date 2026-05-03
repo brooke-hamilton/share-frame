@@ -21,6 +21,7 @@ struct WindowState {
     tracking_mouse: bool,
     focused: bool,
     theme: geometry::ThemeColors,
+    icon: HICON,
 }
 
 const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
@@ -109,6 +110,16 @@ pub fn create_and_run() -> windows::core::Result<()> {
     unsafe {
         let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
 
+        // Load the application icon from embedded resources (ID 1)
+        let icon = LoadImageW(
+            hinstance,
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE | LR_SHARED,
+        )?;
+
         let wc = WNDCLASSEXW {
             cbSize: mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -116,6 +127,8 @@ pub fn create_and_run() -> windows::core::Result<()> {
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: HICON(icon.0),
+            hIconSm: HICON(icon.0),
             // Use a NULL stock brush rather than a default (null) HBRUSH so
             // DefWindowProc never tries to FillRect with an invalid handle if
             // a future code path forgets to handle WM_ERASEBKGND.
@@ -188,6 +201,17 @@ unsafe extern "system" fn wnd_proc(
             let content_height = (height - geometry::TITLE_BAR_HEIGHT).max(1);
             let cap_state = capture::init(hwnd, width, content_height);
 
+            // Load small icon (16x16) for title bar drawing
+            let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+            let icon_handle = LoadImageW(
+                hinstance,
+                PCWSTR(1 as *const u16),
+                IMAGE_ICON,
+                16,
+                16,
+                LR_SHARED,
+            ).map(|h| HICON(h.0)).unwrap_or_default();
+
             let state = Box::new(WindowState {
                 capture: cap_state,
                 work_area,
@@ -195,6 +219,7 @@ unsafe extern "system" fn wnd_proc(
                 tracking_mouse: false,
                 focused: true,
                 theme: detect_theme(),
+                icon: icon_handle,
             });
 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -238,7 +263,7 @@ unsafe extern "system" fn wnd_proc(
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !ptr.is_null() {
                 let state = &*ptr;
-                render::paint(hwnd, &state.capture, state.close_hovered, state.focused, state.theme);
+                render::paint(hwnd, &state.capture, state.close_hovered, state.focused, state.theme, state.icon);
             } else {
                 // No state yet, do default paint to avoid infinite WM_PAINT loop
                 let mut ps = PAINTSTRUCT::default();

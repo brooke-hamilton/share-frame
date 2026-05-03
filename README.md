@@ -1,102 +1,123 @@
-# Share Frame
+# <img src="assets/icons/logo.svg" width="32" alt="Share Frame logo"/> Share Frame
 
-A lightweight Windows desktop application for ultrawide monitor users who need to share a specific region of their screen during Microsoft Teams calls.
+**Share exactly what you mean.**
+A lightweight screen-region sharing tool for ultrawide monitor users on Microsoft Teams.
 
-Share Frame creates a transparent, resizable, moveable frame window that appears as a shareable application in Teams. Anything visible within the frame is what remote participants see — eliminating the problem of sharing an oversized ultrawide display to viewers on standard monitors.
+[Installation](#installation) •
+[How It Works](#how-it-works) •
+[Features](#features) •
+[Build](#building-from-source) •
+[License](#license)
+
+---
 
 ## The Problem
 
-If you have an ultrawide (21:9 or wider) monitor and share your full screen in Teams, remote participants on standard 16:9 monitors see a tiny, squished view of your desktop. Share Frame solves this by letting you draw a frame around exactly the region you want to share.
+Ultrawide (21:9+) monitors are great for productivity — but terrible for screen sharing. When you share your full display in Teams, remote participants on standard 16:9 monitors see a tiny, letterboxed view that's impossible to read.
 
-## How It Works
+**Share Frame** fixes this. It creates a resizable window that captures only the region you frame, then presents it as a normal shareable window in Teams. Remote viewers see exactly what you want them to see, at full resolution.
 
-1. Launch `share-frame.exe`
-2. A borderless frame appears centered on your primary monitor (default 1920×1080)
-3. Drag the frame over the content you want to share
-4. Resize by dragging edges or corners
-5. In Teams, click **Share content → Window** and select **"Share Frame"**
-6. Remote participants see only the content within your frame
+## Installation
 
-The frame captures the screen region behind it at ~30 FPS using BitBlt and paints that content onto its own window surface, so Teams can capture it as a normal window.
+Build from source (requires [Rust](https://rustup.rs/)):
 
-## Features
-
-- **Transparent frame window** — see through to your desktop while the frame captures and relays the underlying content
-- **Resizable border** — 3px border with 6px corner grips for intuitive freeform resizing
-- **Drag to move** — click anywhere inside the frame to reposition it
-- **Teams-shareable** — registers as a standard Win32 window titled "Share Frame" in the Teams window picker
-- **DPI-aware** — per-monitor DPI v2 support for correct behavior at any scaling level
-- **Single instance** — launching a second copy foregrounds the existing window
-- **Minimal footprint** — single `.exe`, no installer, no runtime dependencies, < 5% CPU
-
-## Requirements
-
-- Windows 10 (version 1903+) or Windows 11
-- Microsoft Teams desktop application (for window sharing)
-
-## Building
-
-### Prerequisites
-
-- [Rust](https://rustup.rs/) (latest stable)
-- Windows MSVC target: `rustup target add x86_64-pc-windows-msvc`
-
-### Build
-
-```bash
+```sh
+git clone https://github.com/brooke-hamilton/share-frame.git
+cd share-frame
 cargo build --release
 ```
 
-The binary is at `target/release/share-frame.exe`. Copy it anywhere and run — no installation needed.
+Output: `target/release/share-frame.exe` — copy it anywhere and run. No installer or runtime dependencies needed.
 
-### Run Tests
+## How It Works
 
-```bash
-cargo test
+1. **Launch** `share-frame.exe` — a frame window appears centered on your primary monitor
+2. **Position** the frame over the area you want to share (drag to move, edges/corners to resize)
+3. **Place your application windows on top** of Share Frame — the apps you want to demo go in front so you can interact with them normally
+4. **Share** in Teams → *Share content* → *Window* → select **"Share Frame"**
+5. **Done** — remote participants see only what's inside the frame, updated in real time
+
+Share Frame captures the screen region behind it at ~30 FPS and paints that content onto its own window surface. To Teams, it looks like any other application window. Your other windows sit on top of Share Frame so you can click and type in them as usual.
+
+## Features
+
+| Feature | Details |
+|---------|---------|
+| **Transparent capture** | See through to your desktop — the frame relays the content beneath it |
+| **Resizable** | Drag edges or 6px corner grips to any size (min 200×150) |
+| **Drag to move** | Click anywhere inside the frame to reposition |
+| **Teams-ready** | Shows up as "Share Frame" in the window picker |
+| **Adaptive theme** | Follows Windows dark/light mode and accent color |
+| **DPI-aware** | Per-monitor DPI v2 — correct at any scaling level |
+| **Single instance** | Second launch foregrounds the existing window |
+| **Zero install** | Single `.exe`, no runtime dependencies, <5% CPU |
+
+## Usage
+
+| Action | How |
+|--------|-----|
+| Move | Drag anywhere inside the frame |
+| Resize | Drag any edge or corner |
+| Close | Click the × button or Alt+F4 |
+
+**Default size:** 1920×1080 or 75% of monitor width (whichever is smaller), 16:9 aspect ratio.
+
+## System Requirements
+
+- Windows 10 version 2004+ or Windows 11
+- Microsoft Teams desktop app (for window sharing)
+
+## Building from Source
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) (stable toolchain)
+- Windows MSVC target (default on Windows)
+
+### Build
+
+```sh
+cargo build --release
 ```
 
-Tests cover the geometry module: coordinate math, DPI scaling, hit testing, size/position constraints.
+Output: `target/release/share-frame.exe`
+
+### Regenerate Icon
+
+Requires [resvg](https://github.com/nicodemus26/resvg) (`cargo install resvg`):
+
+```sh
+./scripts/generate-icon.ps1
+```
+
+Converts `assets/icons/logo.svg` → `assets/icons/share-frame.ico` at 16/32/48/256px.
 
 ## Architecture
 
 ```
 src/
-├── main.rs       # Entry point: DPI awareness, single-instance mutex, error handling
-├── window.rs     # Win32 window creation, WndProc message dispatch, message loop
-├── capture.rs    # BitBlt screen capture with WS_EX_LAYERED alpha toggle at ~30 FPS
-├── render.rs     # WM_PAINT: blit captured content, draw border and corner grips
-└── geometry.rs   # Coordinate math, DPI scaling, hit testing, constraints (unit tested)
+├── main.rs       Entry point — DPI awareness, single-instance mutex
+├── window.rs     Win32 window creation, WndProc message loop
+├── capture.rs    BitBlt screen capture at ~30 FPS with display affinity
+├── render.rs     Double-buffered painting: content, title bar, border
+└── geometry.rs   Coordinate math, hit testing, size/position constraints
 ```
 
-### Key Technical Decisions
+### Key Design Decisions
 
-| Decision | Approach | Why |
-|----------|----------|-----|
-| Screen capture | BitBlt from desktop DC | Simplest, lowest overhead for 30 FPS |
-| Feedback loop avoidance | WS_EX_LAYERED + alpha toggle (0→capture→255) | DWM keeps the redirected surface so Teams always sees content |
-| Window style | WS_POPUP + custom WM_NCHITTEST | Borderless with native OS resize/move behavior |
-| Rendering | GDI BitBlt/StretchBlt | Zero-overhead blit, no Direct2D setup needed |
-| DPI | Per-monitor DPI aware v2 | Correct scaling on all display configurations |
-| Single instance | Named mutex + FindWindowW | Standard Win32 pattern |
+| Decision | Approach | Rationale |
+|----------|----------|-----------|
+| Screen capture | `BitBlt` from desktop DC | Lowest overhead for 30 FPS refresh |
+| Self-capture avoidance | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` | Window stays visible on display but excluded from capture APIs |
+| Window style | `WS_POPUP` + custom `WM_NCHITTEST` | Borderless with native OS resize/move behavior |
+| Rendering | GDI double-buffer + `BitBlt` | Zero-dependency blit, no Direct2D/D3D setup |
+| DPI | Per-monitor DPI aware v2 | Correct scaling across mixed-DPI setups |
+| Single instance | Named mutex + `FindWindowW` | Standard Win32 pattern |
 
-## Usage Tips
+## Contributing
 
-- **Resize**: Drag any edge or corner of the frame
-- **Move**: Click and drag anywhere inside the frame
-- **Close**: Alt+F4 or end the process
-- **Default size**: 1920×1080 or 75% of monitor width (whichever is smaller), 16:9 aspect ratio
-- **Minimum size**: 200×150 pixels
-
-## Project Structure
-
-```
-├── Cargo.toml              # Rust package manifest
-├── src/                    # Application source code
-├── specs/001-share-frame/  # Design documents (spec, plan, tasks, research)
-├── share-frame.md          # Original feature description
-└── .specify/               # Spec Kit configuration
-```
+Contributions are welcome! Please open an issue to discuss changes before submitting a PR.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © Brooke Hamilton
