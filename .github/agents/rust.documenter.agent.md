@@ -1,5 +1,5 @@
 ---
-name: "Project Documenter"
+name: "Rust Project Documenter"
 description: "Generates professional project documentation with Mermaid architecture diagrams for Rust projects. Analyzes Cargo.toml, module structure, traits, and crate dependencies. Produces Markdown with embedded Mermaid diagrams."
 tools:
   [
@@ -83,7 +83,31 @@ Structure documentation and diagrams using C4 Model abstraction levels:
 
 Execute these steps **in order**. Use the todo list to track progress.
 
-### Step 1: Discover and Analyze Project Context
+### Step 1: Audit Existing Documentation
+
+Check for existing documentation in `docs/`, `README.md`, `ARCHITECTURE.md`, and any other Markdown files at the repo root or in `docs/`.
+
+- If `docs/project-summary.md` does not exist, skip to Step 2.
+- If it exists, validate every claim against the actual source code:
+  - **File paths**: Verify every referenced file and directory still exists.
+  - **Module structure**: Confirm the documented module tree matches `mod` declarations in `src/`.
+  - **Traits and types**: Confirm documented traits, structs, and enums exist with the documented signatures.
+  - **Dependencies**: Cross-check the dependency table against `Cargo.toml`.
+  - **Diagrams**: Verify Mermaid diagrams reflect the current architecture — no stale nodes, missing modules, or outdated relationships.
+  - **Pipeline/flow descriptions**: Confirm processing steps match the actual call chain in the code.
+
+Then scan for architecture elements that are missing or insufficiently documented:
+
+- New modules, traits, structs, or enums not mentioned in docs.
+- Public API surface changes (new or removed public functions).
+- New dependencies or removed dependencies.
+- New feature flags or build configuration changes.
+- Changes to error handling patterns, concurrency model, or FFI boundaries.
+- Infrastructure changes (Dockerfile, CI/CD workflows, build scripts).
+
+Flag all inaccuracies and gaps — they will be corrected during regeneration.
+
+### Step 2: Discover and Analyze Project Context
 
 Build a complete understanding of the codebase before writing anything.
 
@@ -131,7 +155,7 @@ Check for and read (if they exist):
 - **Concurrency**: Channels, mutexes, atomics, async tasks
 - **Extension points**: Traits to implement, feature flags, plugin architecture
 
-### Step 2: Generate Mermaid Diagrams
+### Step 3: Generate Mermaid Diagrams
 
 Generate **3-5 professional diagrams** as Mermaid code blocks embedded directly in the Markdown document.
 
@@ -162,7 +186,7 @@ Generate **3-5 professional diagrams** as Mermaid code blocks embedded directly 
 - Use subgraphs to group related components
 - Validate that all Mermaid syntax is correct before writing
 
-### Step 3: Write Markdown Document
+### Step 4: Write Markdown Document
 
 Create `docs/project-summary.md` with these sections:
 
@@ -198,7 +222,7 @@ flowchart TD
 ```
 ````
 
-### Step 4: Verify and Report
+### Step 5: Verify and Report
 
 #### Quality Checklist
 
