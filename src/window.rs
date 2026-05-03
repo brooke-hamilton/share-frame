@@ -540,8 +540,36 @@ unsafe fn on_lbutton_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
+        // Activate the topmost visible application window now that we moved
+        // to the back of the Z-order.
+        if let Some(top) = find_topmost_app_window(hwnd) {
+            let _ = SetForegroundWindow(top);
+        }
     }
     LRESULT(0)
+}
+
+/// Finds the topmost visible, non-minimized application window in Z-order,
+/// skipping `exclude`. Returns `None` if no suitable window is found.
+unsafe fn find_topmost_app_window(exclude: HWND) -> Option<HWND> {
+    let Ok(mut current) = GetWindow(GetDesktopWindow(), GW_CHILD) else {
+        return None;
+    };
+    loop {
+        if current != exclude
+            && IsWindowVisible(current).as_bool()
+            && !IsIconic(current).as_bool()
+        {
+            let ex_style = GetWindowLongPtrW(current, GWL_EXSTYLE) as u32;
+            if (ex_style & WS_EX_TOOLWINDOW.0) == 0 {
+                return Some(current);
+            }
+        }
+        current = match GetWindow(current, GW_HWNDNEXT) {
+            Ok(next) => next,
+            Err(_) => return None,
+        };
+    }
 }
 
 /// Returns the width of DWM-drawn caption buttons (close + maximize +
