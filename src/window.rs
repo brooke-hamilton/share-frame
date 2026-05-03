@@ -155,7 +155,7 @@ pub fn create_and_run() -> windows::core::Result<()> {
             WS_EX_APPWINDOW | WS_EX_LAYERED,
             CLASS_NAME,
             WINDOW_TITLE,
-            WS_POPUP | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE,
+            WS_POPUP | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
             pos.x,
             pos.y,
             size.width,
