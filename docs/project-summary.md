@@ -126,7 +126,7 @@ classDiagram
 ### Module Responsibilities
 
 | Module | File | Responsibility |
-|--------|------|----------------|
+| -------- | ------ | ---------------- |
 | `main` | [src/main.rs](../src/main.rs) | Entry point. Sets per-monitor DPI v2 awareness, enforces single instance via named mutex (`ShareFrame_SingleInstance_Mutex`), calls `window::create_and_run()`. |
 | `window` | [src/window.rs](../src/window.rs) | Registers window class (`ShareFrameClass`), creates the popup window, runs the `GetMessageW` loop, and dispatches all Win32 messages through `wnd_proc`. Owns `WindowState`. |
 | `capture` | [src/capture.rs](../src/capture.rs) | Manages screen capture. Creates a memory DC and compatible bitmap, runs a 33 ms timer, performs `BitBlt` capture with display-affinity toggling, handles resize/cleanup. |
@@ -136,7 +136,7 @@ classDiagram
 ### Key Structs
 
 | Struct | Module | Purpose |
-|--------|--------|---------|
+| -------- | -------- | --------- |
 | `CaptureState` | `capture` | Holds memory DC, bitmap, timer ID, dimensions, and flags (`capture_ok`, `affinity_supported`, `paused`). |
 | `WindowState` | `window` | Per-window state: `CaptureState`, work area, close-button hover, mouse tracking, focus, theme colors, icon handle. Stored via `GWLP_USERDATA`. |
 | `Point` | `geometry` | 2D coordinate (`x`, `y`). |
@@ -147,7 +147,7 @@ classDiagram
 ### Constants
 
 | Constant | Value | Module | Purpose |
-|----------|-------|--------|---------|
+| -------- | ----- | ------ | ------- |
 | `TIMER_ID` | 1 | `capture` | Win32 timer identifier |
 | `FRAME_INTERVAL_MS` | 33 | `capture` | Capture interval (~30 FPS) |
 | `BORDER_WIDTH` | 2 | `geometry` | Window border thickness (px) |
@@ -163,7 +163,7 @@ classDiagram
 Share Frame is a binary crate (`[[bin]]`), not a library. There is no public API for external consumers. Internal module visibility follows Rust conventions:
 
 | Function | Signature | Visibility |
-|----------|-----------|------------|
+| -------- | --------- | ---------- |
 | `window::create_and_run` | `() -> windows::core::Result<()>` | `pub` (crate) |
 | `capture::init` | `(HWND, i32, i32) -> CaptureState` | `pub` (crate) |
 | `capture::capture_frame` | `(HWND, &mut CaptureState) -> bool` | `pub` (crate) |
@@ -185,7 +185,7 @@ Helper functions `logical_to_physical` and `physical_to_logical` are `#[cfg(test
 ### Build Pipeline
 
 | Stage | Tool | Description |
-|-------|------|-------------|
+| ------- | ------ | ------------- |
 | Icon embedding | `build.rs` + `embed-resource` crate | Compiles [resources.rc](../resources.rc) to embed [share-frame.ico](../assets/icons/share-frame.ico) as resource ID 1 |
 | Compilation | `cargo build --release` | Rust stable MSVC toolchain, Windows target |
 | Release optimizations | `Cargo.toml` `[profile.release]` | `strip = true`, `lto = true` for minimal binary size |
@@ -249,39 +249,9 @@ The `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` attribu
 - Don't assume logical == physical pixels — always work in physical pixels after DPI setup.
 - Don't add async runtimes or heavy dependencies — the project targets single-binary, zero-install deployment.
 
-## 9. Dependencies
+## 9. Code Structure
 
-### Runtime Dependencies
-
-| Crate | Version | Purpose |
-|-------|---------|---------|
-| `windows` | 0.58 | Win32 API bindings (GDI, DWM, UI, Threading, Registry, HiDpi, Security) |
-
-### Build Dependencies
-
-| Crate | Version | Purpose |
-|-------|---------|---------|
-| `embed-resource` | 3 | Compiles Windows `.rc` resource files into the binary |
-
-### Windows Crate Feature Flags
-
-| Feature | Used For |
-|---------|----------|
-| `Win32_Foundation` | `HWND`, `HINSTANCE`, `BOOL`, `LRESULT`, error types |
-| `Win32_UI_WindowsAndMessaging` | Window creation, message loop, `WndProc`, icons, cursors |
-| `Win32_UI_Controls` | `WM_MOUSELEAVE` constant |
-| `Win32_UI_Input_KeyboardAndMouse` | `TrackMouseEvent`, `TME_LEAVE` |
-| `Win32_Graphics_Gdi` | `BitBlt`, `StretchBlt`, `AlphaBlend`, DC/bitmap management, monitors |
-| `Win32_Graphics_Dwm` | `DwmFlush`, `DwmSetWindowAttribute` (rounded corners) |
-| `Win32_System_LibraryLoader` | `GetModuleHandleW` |
-| `Win32_System_Registry` | Theme detection (dark/light mode, accent color) |
-| `Win32_System_Threading` | `CreateMutexW` for single-instance enforcement |
-| `Win32_UI_HiDpi` | `SetProcessDpiAwarenessContext`, per-monitor DPI v2 |
-| `Win32_Security` | Security descriptor types for mutex creation |
-
-## 10. Code Structure
-
-```
+```text
 share-frame/
 ├── Cargo.toml                  # Crate config: windows 0.58, embed-resource 3, LTO release
 ├── Cargo.lock                  # Locked dependency versions
