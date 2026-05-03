@@ -118,7 +118,7 @@ pub fn physical_to_logical(physical: i32, dpi: u32) -> i32 {
 // --- Win32-Dependent Functions ---
 
 /// Returns the width of DWM-drawn caption buttons (close + maximize +
-/// disabled minimize), falling back to a constant if the API is unavailable.
+/// minimize), falling back to a constant if the API is unavailable.
 pub unsafe fn caption_buttons_width(hwnd: windows::Win32::Foundation::HWND) -> i32 {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::*;

@@ -122,6 +122,16 @@ impl CaptureState {
         // SAFETY: Win32 handles used here are owned by `self` or fetched
         // and released within this scope.
         unsafe {
+            // Skip the entire capture pipeline when the window is not
+            // observable — minimized or hidden. The affinity toggle,
+            // `DwmFlush` (which blocks waiting for the next compose), the
+            // fullscreen `BitBlt`, and the forced repaint together account
+            // for the bulk of this app's idle CPU usage; doing none of it
+            // when nothing is on screen is functionally equivalent.
+            if IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+                return self.capture_ok;
+            }
+
             if self.affinity_supported {
                 if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
                     self.affinity_supported = false;
@@ -139,7 +149,6 @@ impl CaptureState {
                 if self.affinity_supported {
                     let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
                 }
-                let _ = InvalidateRect(hwnd, None, false);
                 return false;
             }
 
@@ -173,8 +182,16 @@ impl CaptureState {
                 let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
             }
 
+            let was_ok = self.capture_ok;
             self.capture_ok = ok.is_ok();
-            let _ = InvalidateRect(hwnd, None, false);
+            // Only request a repaint when there's something new to draw:
+            // a fresh frame succeeded, or the success state just flipped
+            // (e.g. transitioning into the error-fill state). Skipping the
+            // repaint on a steady-state failure avoids needlessly re-running
+            // the renderer 30×/sec while capture remains broken.
+            if self.capture_ok || was_ok != self.capture_ok {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
             self.capture_ok
         }
     }

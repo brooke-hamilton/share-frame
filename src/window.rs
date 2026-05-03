@@ -22,6 +22,7 @@ struct WindowState {
     send_back_hovered: bool,
     tracking_mouse: bool,
     title_bar_height: i32,
+    is_active: bool,
 }
 
 const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
@@ -71,10 +72,18 @@ fn color_prevalence() -> bool {
 }
 
 /// Computes the current title-bar color scheme from the system theme,
-/// accent-color setting, and DWM colorization color so our custom title bar
-/// matches whatever DWM paints in the caption-buttons strip.
-fn current_title_bar_theme() -> TitleBarTheme {
+/// accent-color setting, DWM colorization color, and the window's focus
+/// state so our custom title bar matches whatever DWM paints in the
+/// caption-buttons strip (which switches to a neutral inactive color when
+/// the window loses focus).
+fn current_title_bar_theme(active: bool) -> TitleBarTheme {
     let dark = is_dark_mode();
+
+    if !active {
+        // DWM paints the caption-buttons strip in a neutral inactive color
+        // regardless of the accent / color-prevalence setting. Match it.
+        return inactive_theme(dark);
+    }
 
     if color_prevalence() {
         // SAFETY: Out parameters are local stack values.
@@ -111,6 +120,25 @@ fn current_title_bar_theme() -> TitleBarTheme {
             background: COLORREF(0x00FFFFFF),
             text: COLORREF(0x00000000),
             hover: COLORREF(0x00CCCCCC),
+        }
+    }
+}
+
+/// Title-bar colors used when the window is not the foreground window.
+/// Approximates the neutral inactive caption color DWM paints behind the
+/// caption buttons in Windows 10/11.
+fn inactive_theme(dark: bool) -> TitleBarTheme {
+    if dark {
+        TitleBarTheme {
+            background: COLORREF(0x002B2B2B),
+            text: COLORREF(0x006B6B6B),
+            hover: COLORREF(0x003F3F3F),
+        }
+    } else {
+        TitleBarTheme {
+            background: COLORREF(0x00F3F3F3),
+            text: COLORREF(0x009B9B9B),
+            hover: COLORREF(0x00DADADA),
         }
     }
 }
@@ -188,7 +216,7 @@ pub fn create_and_run() -> windows::core::Result<()> {
             WS_EX_APPWINDOW,
             CLASS_NAME,
             WINDOW_TITLE,
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_VISIBLE,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
             pos.x,
             pos.y,
             size.width,
@@ -368,6 +396,20 @@ unsafe extern "system" fn wnd_proc(
             let _ = InvalidateRect(hwnd, None, FALSE);
             LRESULT(0)
         }
+        WM_NCACTIVATE => {
+            // Track focus so the custom title bar can match the inactive
+            // color DWM paints in the caption-buttons strip. Forward to
+            // `DefWindowProc` (with `wparam` preserved) so DWM still
+            // updates the buttons themselves.
+            let active = wparam.0 != 0;
+            with_state(hwnd, |state| {
+                if state.is_active != active {
+                    state.is_active = active;
+                    let _ = InvalidateRect(hwnd, None, FALSE);
+                }
+            });
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_ERASEBKGND => LRESULT(1),
         WM_MOUSEMOVE => on_mouse_move(hwnd, lparam),
         WM_MOUSELEAVE => on_mouse_leave(hwnd),
@@ -396,6 +438,8 @@ unsafe fn on_create(hwnd: HWND) -> LRESULT {
         send_back_hovered: false,
         tracking_mouse: false,
         title_bar_height,
+        // Newly created top-level windows are activated by the OS.
+        is_active: true,
     });
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -423,8 +467,8 @@ unsafe fn on_timer(hwnd: HWND) -> LRESULT {
 
 unsafe fn on_paint(hwnd: HWND) -> LRESULT {
     let dpi = GetDpiForWindow(hwnd);
-    let theme = current_title_bar_theme();
     let painted = with_state(hwnd, |state| {
+        let theme = current_title_bar_theme(state.is_active);
         render::paint(
             hwnd,
             &state.capture,
@@ -649,7 +693,7 @@ unsafe fn find_topmost_app_window(exclude: HWND) -> Option<HWND> {
 }
 
 /// Returns the width of DWM-drawn caption buttons (close + maximize +
-/// disabled minimize), falling back to a constant if the API fails.
+/// minimize), falling back to a constant if the API fails.
 unsafe fn caption_buttons_width(hwnd: HWND) -> i32 {
     geometry::caption_buttons_width(hwnd)
 }
