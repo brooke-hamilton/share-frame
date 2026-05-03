@@ -60,7 +60,7 @@ pub fn paint(hwnd: HWND, state: &CaptureState, close_button_hovered: bool, focus
 
         // --- Grid Overlay (subtle visual cue that overlay is present) ---
         let content_height = ch - tb_height;
-        if content_height > 0 && cw > 0 {
+        if focused && content_height > 0 && cw > 0 {
             let grid_dc = CreateCompatibleDC(hdc);
             let grid_bmp = CreateCompatibleBitmap(hdc, cw, content_height);
             let old_grid_bmp = SelectObject(grid_dc, grid_bmp);
