@@ -19,10 +19,11 @@ fn main() {
         // Single-instance enforcement via named mutex.
         // The handle MUST live for the lifetime of `main` so the OS sees the
         // mutex as held while this instance is running. `HANDLE` has no `Drop`
-        // impl, so binding it (without `CloseHandle`) is sufficient — the
-        // kernel keeps the named mutex alive until the process exits.
+        // impl, so the binding (named, not `_`) keeps it in scope until
+        // `main` returns; the kernel then releases the named mutex on
+        // process exit.
         let mutex_name = w!("ShareFrame_SingleInstance_Mutex");
-        let _mutex_guard = match CreateMutexW(None, FALSE, mutex_name) {
+        let _instance_lock = match CreateMutexW(None, FALSE, mutex_name) {
             Ok(handle) => {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
                     // Another instance is running — close our duplicate
@@ -55,7 +56,8 @@ fn main() {
             );
         }
 
-        // Reference the guard so the binding survives the message loop.
-        let _ = &_mutex_guard;
+        // The named binding keeps `_instance_lock` alive until the end of
+        // `main`. `HANDLE` is `Copy` and has no `Drop`, so an explicit drop
+        // would be a no-op; relying on scope is sufficient.
     }
 }

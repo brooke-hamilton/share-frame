@@ -1,2 +1,36 @@
 // Application icon — ID 1 is the default icon Windows uses for the exe.
 1 ICON "assets\\icons\\share-frame.ico"
+
+// Version information — Task Manager's "Name" column reads FileDescription
+// from this resource. Without it Task Manager falls back to the on-disk
+// filename ("share-frame.exe").
+#include <winver.h>
+
+1 VERSIONINFO
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 040904B0 = U.S. English (0x0409), Unicode (0x04B0).
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Brooke Hamilton"
+            VALUE "FileDescription",  "Share Frame"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "share-frame"
+            VALUE "OriginalFilename", "share-frame.exe"
+            VALUE "ProductName",      "Share Frame"
+            VALUE "ProductVersion",   "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x04B0
+    END
+END

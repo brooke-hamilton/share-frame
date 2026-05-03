@@ -2,6 +2,12 @@
 name = "share-frame"
 version = "0.1.0"
 edition = "2021"
+description = "Windows desktop overlay that mirrors the screen region behind it for screen-sharing."
+license = "MIT"
+repository = "https://github.com/brooke-hamilton/share-frame"
+keywords = ["windows", "screen-share", "overlay", "win32", "gdi"]
+categories = ["gui", "os::windows-apis"]
+publish = false
 
 [dependencies.windows]
 version = "0.58"

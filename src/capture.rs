@@ -7,179 +7,222 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const TIMER_ID: usize = 1;
 const FRAME_INTERVAL_MS: u32 = 33;
 
+/// Owns the off-screen GDI buffer used to capture the desktop region behind
+/// the window, plus the per-frame timer driving recapture.
+///
+/// All resources are released by the [`Drop`] impl, so the only requirement
+/// on the caller is to drop (or replace) the value before the owning `HWND`
+/// is destroyed.
 pub struct CaptureState {
-    pub timer_id: usize,
-    pub memory_dc: HDC,
-    pub bitmap: HBITMAP,
-    /// The 1x1 default bitmap that was selected into memory_dc when it was
-    /// created. We keep it so we can re-select it before deleting `memory_dc`.
+    hwnd: HWND,
+    timer_id: usize,
+    memory_dc: HDC,
+    bitmap: HBITMAP,
+    /// The 1×1 default bitmap selected into `memory_dc` at creation time.
+    /// Re-selected before `memory_dc` is deleted.
     default_bitmap: HGDIOBJ,
-    pub width: i32,
-    pub height: i32,
-    pub capture_ok: bool,
-    /// Set to false after the first SetWindowDisplayAffinity call fails. When
-    /// false we skip the affinity dance entirely (it has no effect anyway) and
-    /// accept that the window may include itself in the capture on platforms
-    /// that do not support WDA_EXCLUDEFROMCAPTURE (pre Win10 2004).
-    pub affinity_supported: bool,
-    /// When true, timer-driven captures are skipped (e.g. during interactive
-    /// resize/move). The painter will continue to display the last captured
-    /// frame, stretched to fit the current client size.
-    pub paused: bool,
+    width: i32,
+    height: i32,
+    capture_ok: bool,
+    /// Set to `false` once `SetWindowDisplayAffinity` has failed once. When
+    /// `false` we skip the affinity dance entirely (it has no effect anyway)
+    /// and accept that the window may include itself in the capture on
+    /// platforms that do not support `WDA_EXCLUDEFROMCAPTURE` (pre Win10 2004).
+    affinity_supported: bool,
+    /// When `true`, timer-driven captures are skipped (e.g. during
+    /// interactive resize/move). The painter continues to display the last
+    /// captured frame, stretched to fit the current client size.
+    paused: bool,
 }
 
-/// Initializes capture state: creates memory DC, compatible bitmap, starts timer.
-/// `width`/`height` are physical pixels (the window is per-monitor DPI aware
-/// so its client / window rects are already in physical coordinates).
-pub fn init(hwnd: HWND, width: i32, height: i32) -> CaptureState {
-    let phys_w = width.max(1);
-    let phys_h = height.max(1);
+impl CaptureState {
+    /// Creates the capture buffer (memory DC + compatible bitmap) and starts
+    /// the per-frame timer. `width`/`height` are physical pixels for the
+    /// content region (not the full window).
+    pub fn new(hwnd: HWND, width: i32, height: i32) -> Self {
+        let phys_w = width.max(1);
+        let phys_h = height.max(1);
 
-    unsafe {
-        let screen_dc = GetDC(None);
-        let memory_dc = CreateCompatibleDC(screen_dc);
-        let bitmap = CreateCompatibleBitmap(screen_dc, phys_w, phys_h);
-        let default_bitmap = SelectObject(memory_dc, bitmap);
-        ReleaseDC(None, screen_dc);
+        // SAFETY: All handles are stored on `Self` and released by `Drop`.
+        // `hwnd` is owned by the caller and must outlive this value.
+        unsafe {
+            let screen_dc = GetDC(None);
+            let memory_dc = CreateCompatibleDC(screen_dc);
+            let bitmap = CreateCompatibleBitmap(screen_dc, phys_w, phys_h);
+            let default_bitmap = SelectObject(memory_dc, bitmap);
+            let _ = ReleaseDC(None, screen_dc);
 
-        let timer_id = SetTimer(hwnd, TIMER_ID, FRAME_INTERVAL_MS, None);
+            let timer_id = SetTimer(hwnd, TIMER_ID, FRAME_INTERVAL_MS, None);
 
-        CaptureState {
-            timer_id,
-            memory_dc,
-            bitmap,
-            default_bitmap,
-            width: phys_w,
-            height: phys_h,
-            capture_ok: true,
-            affinity_supported: true,
-            paused: false,
-        }
-    }
-}
-
-/// Captures the desktop region behind the window.
-/// Temporarily excludes the window from screen capture via display affinity
-/// so BitBlt does not pick up the window itself (avoids recursive self-capture).
-/// The window stays fully visible on the physical monitor — no flicker.
-pub fn capture_frame(hwnd: HWND, state: &mut CaptureState) -> bool {
-    if state.paused {
-        return state.capture_ok;
-    }
-
-    unsafe {
-        // Hide from screen-capture APIs (Win10 2004+). The window stays visible
-        // on the physical display, so there is no user-visible flicker.
-        if state.affinity_supported {
-            if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
-                // The platform does not support per-window capture exclusion.
-                // Stop trying to toggle it; subsequent captures will simply
-                // include this window in the BitBlt source. Better than
-                // failing every frame.
-                state.affinity_supported = false;
-            } else {
-                // Wait for DWM to composite a frame with the updated affinity
-                // so the subsequent BitBlt does not include this window.
-                let _ = DwmFlush();
+            Self {
+                hwnd,
+                timer_id,
+                memory_dc,
+                bitmap,
+                default_bitmap,
+                width: phys_w,
+                height: phys_h,
+                capture_ok: true,
+                affinity_supported: true,
+                paused: false,
             }
         }
+    }
 
-        let desktop_dc = GetDC(None);
-        if desktop_dc.is_invalid() {
-            state.capture_ok = false;
-            if state.affinity_supported {
+    /// Width of the off-screen capture bitmap, in physical pixels.
+    pub fn width(&self) -> i32 {
+        self.width
+    }
+
+    /// Height of the off-screen capture bitmap, in physical pixels.
+    pub fn height(&self) -> i32 {
+        self.height
+    }
+
+    /// `true` if the most recent capture call succeeded.
+    pub fn capture_ok(&self) -> bool {
+        self.capture_ok
+    }
+
+    /// Memory DC backing the captured frame; the renderer blits from this
+    /// into its own back-buffer.
+    pub fn memory_dc(&self) -> HDC {
+        self.memory_dc
+    }
+
+    /// `true` when timer-driven capture is currently suspended.
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Suspends timer-driven capture (call on `WM_ENTERSIZEMOVE`).
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    /// Resumes timer-driven capture (call on `WM_EXITSIZEMOVE`).
+    pub fn resume(&mut self) {
+        self.paused = false;
+    }
+
+    /// Captures the desktop region behind the window into the off-screen
+    /// bitmap. Temporarily excludes the window from screen capture via
+    /// `WDA_EXCLUDEFROMCAPTURE` so `BitBlt` does not pick up the window
+    /// itself. The window stays fully visible on the physical monitor —
+    /// no flicker.
+    ///
+    /// Returns the value of [`Self::capture_ok`] after the attempt.
+    pub fn capture_frame(&mut self) -> bool {
+        if self.paused {
+            return self.capture_ok;
+        }
+
+        let hwnd = self.hwnd;
+
+        // SAFETY: Win32 handles used here are owned by `self` or fetched
+        // and released within this scope.
+        unsafe {
+            if self.affinity_supported {
+                if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
+                    self.affinity_supported = false;
+                } else {
+                    // Wait for DWM to composite a frame with the updated
+                    // affinity so the subsequent BitBlt does not include
+                    // this window.
+                    let _ = DwmFlush();
+                }
+            }
+
+            let desktop_dc = GetDC(None);
+            if desktop_dc.is_invalid() {
+                self.capture_ok = false;
+                if self.affinity_supported {
+                    let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
+                }
+                let _ = InvalidateRect(hwnd, None, false);
+                return false;
+            }
+
+            // Get client area origin in screen coordinates, offset by the
+            // synthesized title bar so the captured region matches what the
+            // renderer will draw beneath the title bar.
+            let mut client_origin = POINT { x: 0, y: 0 };
+            let _ = ClientToScreen(hwnd, &mut client_origin);
+            let dpi = GetDpiForWindow(hwnd);
+            let frame_y = GetSystemMetricsForDpi(SM_CYFRAME, dpi);
+            let caption = GetSystemMetricsForDpi(SM_CYCAPTION, dpi);
+            let padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            let title_bar_height = frame_y + caption + padding;
+            client_origin.y += title_bar_height;
+
+            let ok = BitBlt(
+                self.memory_dc,
+                0,
+                0,
+                self.width,
+                self.height,
+                desktop_dc,
+                client_origin.x,
+                client_origin.y,
+                SRCCOPY,
+            );
+
+            let _ = ReleaseDC(None, desktop_dc);
+
+            if self.affinity_supported {
                 let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
             }
+
+            self.capture_ok = ok.is_ok();
             let _ = InvalidateRect(hwnd, None, false);
-            return false;
+            self.capture_ok
+        }
+    }
+
+    /// Recreates the off-screen bitmap to match new content dimensions.
+    /// `width`/`height` are physical pixels.
+    pub fn resize(&mut self, width: i32, height: i32) {
+        let phys_w = width.max(1);
+        let phys_h = height.max(1);
+
+        if phys_w == self.width && phys_h == self.height {
+            return;
         }
 
-        // Get window rect (physical pixels on DPI-aware window)
-        let mut win_rect = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut win_rect);
+        // SAFETY: `memory_dc` and `bitmap` are owned by `self`.
+        unsafe {
+            let screen_dc = GetDC(None);
+            let new_bitmap = CreateCompatibleBitmap(screen_dc, phys_w, phys_h);
+            let _ = ReleaseDC(None, screen_dc);
 
-        // Get client area origin in screen coordinates, offset by title bar
-        let mut client_origin = POINT { x: 0, y: 0 };
-        let _ = ClientToScreen(hwnd, &mut client_origin);
-        let dpi = GetDpiForWindow(hwnd);
-        let frame_y = GetSystemMetricsForDpi(SM_CYFRAME, dpi);
-        let caption = GetSystemMetricsForDpi(SM_CYCAPTION, dpi);
-        let padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-        let title_bar_height = frame_y + caption + padding;
-        client_origin.y += title_bar_height;
+            SelectObject(self.memory_dc, new_bitmap);
+            let _ = DeleteObject(self.bitmap);
 
-        // Capture the screen area behind the content region (below the title bar)
-        let ok = BitBlt(
-            state.memory_dc,
-            0,
-            0,
-            state.width,
-            state.height,
-            desktop_dc,
-            client_origin.x,
-            client_origin.y,
-            SRCCOPY,
-        );
-
-        ReleaseDC(None, desktop_dc);
-
-        // Restore normal affinity so downstream capture (e.g. Teams) sees this
-        // window's content.
-        if state.affinity_supported {
-            let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
+            self.bitmap = new_bitmap;
+            self.width = phys_w;
+            self.height = phys_h;
         }
-
-        state.capture_ok = ok.is_ok();
-
-        let _ = InvalidateRect(hwnd, None, false);
-
-        state.capture_ok
     }
 }
 
-/// Recreates the bitmap to match new window dimensions.
-/// `width`/`height` are physical pixels.
-pub fn resize(state: &mut CaptureState, width: i32, height: i32) {
-    let phys_w = width.max(1);
-    let phys_h = height.max(1);
-
-    if phys_w == state.width && phys_h == state.height {
-        return;
-    }
-
-    unsafe {
-        let screen_dc = GetDC(None);
-        let new_bitmap = CreateCompatibleBitmap(screen_dc, phys_w, phys_h);
-        ReleaseDC(None, screen_dc);
-
-        // Select new bitmap into memory DC (deselects old one)
-        SelectObject(state.memory_dc, new_bitmap);
-
-        // Delete old bitmap
-        let _ = DeleteObject(state.bitmap);
-
-        state.bitmap = new_bitmap;
-        state.width = phys_w;
-        state.height = phys_h;
-    }
-}
-
-/// Cleans up capture resources.
-pub fn cleanup(state: &mut CaptureState, hwnd: HWND) {
-    unsafe {
-        if state.timer_id != 0 {
-            let _ = KillTimer(hwnd, state.timer_id);
-            state.timer_id = 0;
-        }
-        if !state.memory_dc.is_invalid() {
-            // Reselect the original default bitmap before deleting our own.
-            if !state.default_bitmap.is_invalid() {
-                SelectObject(state.memory_dc, state.default_bitmap);
+impl Drop for CaptureState {
+    fn drop(&mut self) {
+        // SAFETY: Releases handles created in `new` / `resize`. The owning
+        // `HWND` must still be valid; the window proc drops the capture
+        // state during `WM_DESTROY`, before the HWND is invalidated.
+        unsafe {
+            if self.timer_id != 0 {
+                let _ = KillTimer(self.hwnd, self.timer_id);
             }
-            let _ = DeleteDC(state.memory_dc);
-        }
-        if !state.bitmap.is_invalid() {
-            let _ = DeleteObject(state.bitmap);
+            if !self.memory_dc.is_invalid() {
+                if !self.default_bitmap.is_invalid() {
+                    SelectObject(self.memory_dc, self.default_bitmap);
+                }
+                let _ = DeleteDC(self.memory_dc);
+            }
+            if !self.bitmap.is_invalid() {
+                let _ = DeleteObject(self.bitmap);
+            }
         }
     }
 }

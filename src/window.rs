@@ -11,12 +11,14 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::capture;
+use crate::capture::CaptureState;
 use crate::geometry;
-use crate::render;
+use crate::render::{self, RenderCache};
 
+/// Per-window state. Owned via `Box` and stored in `GWLP_USERDATA`.
 struct WindowState {
-    capture: capture::CaptureState,
+    capture: CaptureState,
+    render_cache: RenderCache,
     send_back_hovered: bool,
     tracking_mouse: bool,
     title_bar_height: i32,
@@ -26,13 +28,15 @@ const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
 const WINDOW_TITLE: PCWSTR = w!("Share Frame");
 
 /// Detects whether Windows is in dark mode by reading the registry.
+/// Defaults to `false` (light mode, matching the Windows default) when the
+/// value cannot be read.
 fn is_dark_mode() -> bool {
+    // SAFETY: All registry handles opened here are closed before return.
     unsafe {
         let mut hkey = HKEY::default();
         let subkey = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-        let result = RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &mut hkey);
-        if result.is_err() {
-            return true; // default to dark
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &mut hkey).is_err() {
+            return false;
         }
 
         let value_name = w!("AppsUseLightTheme");
@@ -49,26 +53,42 @@ fn is_dark_mode() -> bool {
         let _ = RegCloseKey(hkey);
 
         if result.is_err() {
-            return true;
+            return false;
         }
-
         data == 0
     }
 }
 
 /// Creates the window and runs the Win32 message loop.
 pub fn create_and_run() -> windows::core::Result<()> {
+    // SAFETY: Standard Win32 window registration / message loop. All handles
+    // are owned by the OS for the lifetime of the process or by the window
+    // state via `Drop`.
     unsafe {
         let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
 
-        // Load the application icon from embedded resources (ID 1)
-        let icon = LoadImageW(
+        // Load the application icon from embedded resources (ID 1) at both
+        // the large and small system sizes so the title-bar icon is crisp.
+        // `PCWSTR(1 as *const u16)` is the Win32 `MAKEINTRESOURCE(1)` idiom
+        // — the low word is interpreted as an integer resource id, not a
+        // string pointer.
+        #[allow(clippy::manual_dangling_ptr)]
+        let icon_lg = LoadImageW(
             hinstance,
             PCWSTR(1 as *const u16),
             IMAGE_ICON,
-            0,
-            0,
-            LR_DEFAULTSIZE | LR_SHARED,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_SHARED,
+        )?;
+        #[allow(clippy::manual_dangling_ptr)]
+        let icon_sm = LoadImageW(
+            hinstance,
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_SHARED,
         )?;
 
         let wc = WNDCLASSEXW {
@@ -78,8 +98,8 @@ pub fn create_and_run() -> windows::core::Result<()> {
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hIcon: HICON(icon.0),
-            hIconSm: HICON(icon.0),
+            hIcon: HICON(icon_lg.0),
+            hIconSm: HICON(icon_sm.0),
             hbrBackground: HBRUSH(GetStockObject(NULL_BRUSH).0),
             ..Default::default()
         };
@@ -89,12 +109,10 @@ pub fn create_and_run() -> windows::core::Result<()> {
             return Err(Error::from_win32());
         }
 
-        // Get primary monitor work area for initial placement
-        let desktop_hwnd = GetDesktopWindow();
-        let work_area = geometry::get_monitor_work_area(desktop_hwnd);
+        // Place the window on the primary monitor's work area.
+        let work_area = geometry::get_monitor_work_area(GetDesktopWindow());
         let monitor_width = work_area.right - work_area.left;
         let monitor_height = work_area.bottom - work_area.top;
-
         let size = geometry::default_size(monitor_width, monitor_height);
         let pos = geometry::centered_position(size, work_area);
 
@@ -117,28 +135,11 @@ pub fn create_and_run() -> windows::core::Result<()> {
             return Err(Error::from_win32());
         }
 
-        // Tell DWM to use dark mode title bar if the system is in dark mode
-        let dark: BOOL = if is_dark_mode() { TRUE } else { FALSE };
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const _ as *const _,
-            mem::size_of_val(&dark) as u32,
-        );
+        apply_dark_mode(hwnd);
+        apply_extended_frame(hwnd);
 
-        // Extend frame into client area so we can draw in the title bar region
-        // while DWM still renders the native caption buttons.
-        let title_bar_height = compute_title_bar_height(hwnd);
-        let margins = MARGINS {
-            cxLeftWidth: 0,
-            cxRightWidth: 0,
-            cyTopHeight: title_bar_height,
-            cyBottomHeight: 0,
-        };
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-
-        // Force the window to re-evaluate its frame (sends WM_NCCALCSIZE again
-        // now that DWM knows about the extended frame).
+        // Force the window to re-evaluate its frame so subsequent
+        // GetClientRect calls reflect the WM_NCCALCSIZE changes.
         let _ = SetWindowPos(
             hwnd,
             None,
@@ -149,9 +150,17 @@ pub fn create_and_run() -> windows::core::Result<()> {
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
 
-        // Message loop
+        // Message loop. `GetMessageW` returns -1 on error; bail out rather
+        // than spinning.
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).into() {
+        loop {
+            let r = GetMessageW(&mut msg, None, 0, 0).0;
+            if r == 0 {
+                break; // WM_QUIT
+            }
+            if r == -1 {
+                return Err(Error::from_win32());
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -160,7 +169,8 @@ pub fn create_and_run() -> windows::core::Result<()> {
     }
 }
 
-/// Computes the title bar height from system metrics for the given DPI.
+/// Computes the title bar height from system metrics for the given window's
+/// current DPI.
 unsafe fn compute_title_bar_height(hwnd: HWND) -> i32 {
     let dpi = GetDpiForWindow(hwnd);
     let frame_y = GetSystemMetricsForDpi(SM_CYFRAME, dpi);
@@ -169,22 +179,78 @@ unsafe fn compute_title_bar_height(hwnd: HWND) -> i32 {
     frame_y + caption + padding
 }
 
+/// Tells DWM to use a dark or light immersive title bar based on the current
+/// system theme.
+unsafe fn apply_dark_mode(hwnd: HWND) {
+    let dark: BOOL = if is_dark_mode() { TRUE } else { FALSE };
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark as *const _ as *const _,
+        mem::size_of_val(&dark) as u32,
+    );
+}
+
+/// Extends the DWM frame into the client area so we can draw in the
+/// title-bar region while DWM still renders the native caption buttons.
+unsafe fn apply_extended_frame(hwnd: HWND) {
+    let title_bar_height = compute_title_bar_height(hwnd);
+    let margins = MARGINS {
+        cxLeftWidth: 0,
+        cxRightWidth: 0,
+        cyTopHeight: title_bar_height,
+        cyBottomHeight: 0,
+    };
+    let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+}
+
+/// Borrows the per-window state stored in `GWLP_USERDATA` for the duration
+/// of `f`. Returns `None` (without invoking `f`) when no state has been
+/// attached yet.
+///
+/// Scoping the borrow inside a closure prevents two concurrent `&mut`
+/// references to the same state from being constructed.
+///
+/// # Safety
+///
+/// Must only be called from the UI thread that owns `hwnd`.
+unsafe fn with_state<R>(hwnd: HWND, f: impl FnOnce(&mut WindowState) -> R) -> Option<R> {
+    let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+    if p.is_null() {
+        None
+    } else {
+        Some(f(&mut *p))
+    }
+}
+
+/// Decodes an `LPARAM` carrying a packed pair of signed 16-bit coordinates
+/// (mouse messages) to `(x, y)` as `i32`.
+fn lparam_to_xy(lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xFFFF) as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+    (x, y)
+}
+
+/// Decodes an `LPARAM` carrying a packed pair of **unsigned** 16-bit
+/// dimensions (used by `WM_SIZE`) to `(width, height)` as `i32`.
+fn lparam_to_size(lparam: LPARAM) -> (i32, i32) {
+    let w = (lparam.0 & 0xFFFF) as u16 as i32;
+    let h = ((lparam.0 >> 16) & 0xFFFF) as u16 as i32;
+    (w, h)
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // For WM_NCHITTEST and WM_NCCALCSIZE we handle ourselves.
-    // For mouse messages in client area, handle ourselves (don't let DWM eat them).
-    // For everything else, let DWM handle caption button interactions.
-    if msg != WM_NCHITTEST
-        && msg != WM_NCCALCSIZE
-        && msg != WM_MOUSEMOVE
-        && msg != WM_MOUSELEAVE
-        && msg != WM_LBUTTONDOWN
-        && msg != WM_LBUTTONUP
-    {
+    // Let DWM handle caption-button interactions for everything except the
+    // messages we own (frame layout and client-area mouse handling).
+    if !matches!(
+        msg,
+        WM_NCHITTEST | WM_NCCALCSIZE | WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONUP
+    ) {
         let mut dwm_result = LRESULT(0);
         if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool() {
             return dwm_result;
@@ -192,98 +258,22 @@ unsafe extern "system" fn wnd_proc(
     }
 
     match msg {
-        WM_CREATE => {
-            let title_bar_height = compute_title_bar_height(hwnd);
-
-            let mut rect = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut rect);
-            let width = (rect.right - rect.left).max(1);
-            let height = (rect.bottom - rect.top).max(1);
-
-            // Capture buffer covers only the content area below the title bar
-            let content_height = (height - title_bar_height).max(1);
-            let cap_state = capture::init(hwnd, width, content_height);
-
-            let state = Box::new(WindowState {
-                capture: cap_state,
-                send_back_hovered: false,
-                tracking_mouse: false,
-                title_bar_height,
-            });
-
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
-
-            LRESULT(0)
-        }
-
-        WM_DESTROY => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !ptr.is_null() {
-                let mut state = Box::from_raw(ptr);
-                capture::cleanup(&mut state.capture, hwnd);
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            }
-            PostQuitMessage(0);
-            LRESULT(0)
-        }
-
-        WM_TIMER => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !ptr.is_null() {
-                let state = &mut *ptr;
-                capture::capture_frame(hwnd, &mut state.capture);
-            }
-            LRESULT(0)
-        }
-
-        WM_PAINT => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !ptr.is_null() {
-                let state = &*ptr;
-                render::paint(hwnd, &state.capture, state.send_back_hovered, state.title_bar_height);
-            } else {
-                let mut ps = PAINTSTRUCT::default();
-                let _ = BeginPaint(hwnd, &mut ps);
-                let _ = EndPaint(hwnd, &ps);
-            }
-            LRESULT(0)
-        }
-
-        WM_SIZE => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !ptr.is_null() {
-                let state = &mut *ptr;
-                let width = (lparam.0 & 0xFFFF) as i32;
-                let height = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                let content_height = height - state.title_bar_height;
-                if width > 0 && content_height > 0 {
-                    capture::resize(&mut state.capture, width, content_height);
-                    if !state.capture.paused {
-                        capture::capture_frame(hwnd, &mut state.capture);
-                    }
-                }
-            }
-            LRESULT(0)
-        }
-
+        WM_CREATE => on_create(hwnd),
+        WM_DESTROY => on_destroy(hwnd),
+        WM_TIMER => on_timer(hwnd),
+        WM_PAINT => on_paint(hwnd),
+        WM_SIZE => on_size(hwnd, lparam),
         WM_ENTERSIZEMOVE => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !ptr.is_null() {
-                (*ptr).capture.paused = true;
-            }
+            with_state(hwnd, |state| state.capture.pause());
             LRESULT(0)
         }
-
         WM_EXITSIZEMOVE => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !ptr.is_null() {
-                let state = &mut *ptr;
-                state.capture.paused = false;
-                capture::capture_frame(hwnd, &mut state.capture);
-            }
+            with_state(hwnd, |state| {
+                state.capture.resume();
+                state.capture.capture_frame();
+            });
             LRESULT(0)
         }
-
         WM_GETMINMAXINFO => {
             let info = lparam.0 as *mut MINMAXINFO;
             if !info.is_null() {
@@ -292,200 +282,271 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-
         WM_NCCALCSIZE => {
-            // Return 0 to make client area = full window rect, removing
-            // the standard non-client frame so we can draw our own title bar.
+            // Return 0 to make client area = full window rect, removing the
+            // standard non-client frame so we can draw our own title bar.
             LRESULT(0)
         }
-
-        WM_NCHITTEST => {
-            let x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-
-            let mut rect = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut rect);
-
-            let margin = geometry::RESIZE_MARGIN;
-
-            // Resize borders (check edges first)
-            if y < rect.top + margin {
-                if x < rect.left + margin {
-                    return LRESULT(HTTOPLEFT as isize);
-                }
-                if x >= rect.right - margin {
-                    return LRESULT(HTTOPRIGHT as isize);
-                }
-                return LRESULT(HTTOP as isize);
-            }
-            if y >= rect.bottom - margin {
-                if x < rect.left + margin {
-                    return LRESULT(HTBOTTOMLEFT as isize);
-                }
-                if x >= rect.right - margin {
-                    return LRESULT(HTBOTTOMRIGHT as isize);
-                }
-                return LRESULT(HTBOTTOM as isize);
-            }
-            if x < rect.left + margin {
-                return LRESULT(HTLEFT as isize);
-            }
-            if x >= rect.right - margin {
-                return LRESULT(HTRIGHT as isize);
-            }
-
-            // Get title bar height from state (or compute)
-            let tb_height = {
-                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
-                if !ptr.is_null() { (*ptr).title_bar_height } else { compute_title_bar_height(hwnd) }
-            };
-
-            // Title bar region
-            if y < rect.top + tb_height {
-                // "Send to Back" button — right side of title bar, before caption buttons
-                let caption_buttons_width = get_caption_buttons_width(hwnd);
-                let button_right = rect.right - caption_buttons_width;
-                let button_left = button_right - geometry::SEND_BACK_BUTTON_WIDTH;
-                if x >= button_left && x < button_right {
-                    return LRESULT(HTCLIENT as isize);
-                }
-
-                // Let DWM check if cursor is over a caption button (close/max)
-                let mut dwm_result = LRESULT(0);
-                if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool() {
-                    return dwm_result;
-                }
-
-                // Otherwise it's the draggable caption area
-                return LRESULT(HTCAPTION as isize);
-            }
-
-            // Client area (content below title bar)
-            LRESULT(HTCLIENT as isize)
-        }
-
-        WM_DPICHANGED => {
-            // Use the suggested rect from lparam
-            let suggested = lparam.0 as *const RECT;
-            if !suggested.is_null() {
-                let r = &*suggested;
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            LRESULT(0)
-        }
-
+        WM_NCHITTEST => on_nc_hit_test(hwnd, msg, wparam, lparam),
+        WM_DPICHANGED => on_dpi_changed(hwnd, lparam),
         WM_SETTINGCHANGE => {
-            // Update dark mode title bar on theme change
-            let dark: BOOL = if is_dark_mode() { TRUE } else { FALSE };
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &dark as *const _ as *const _,
-                mem::size_of_val(&dark) as u32,
-            );
+            apply_dark_mode(hwnd);
             let _ = InvalidateRect(hwnd, None, FALSE);
             LRESULT(0)
         }
-
-        WM_ERASEBKGND => {
-            LRESULT(1)
-        }
-
-        WM_MOUSEMOVE => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !ptr.is_null() {
-                let state = &mut *ptr;
-
-                if !state.tracking_mouse {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut tme);
-                    state.tracking_mouse = true;
-                }
-
-                let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-
-                let mut client_rect = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client_rect);
-                let cw = client_rect.right - client_rect.left;
-
-                let hovered = is_in_send_back_button(hwnd, x, y, cw, state.title_bar_height);
-                if hovered != state.send_back_hovered {
-                    state.send_back_hovered = hovered;
-                    let caption_buttons_width = get_caption_buttons_width(hwnd);
-                    let button_left = cw - caption_buttons_width - geometry::SEND_BACK_BUTTON_WIDTH;
-
-                    // Invalidate the button area
-                    let btn_rect = RECT {
-                        left: button_left,
-                        top: 0,
-                        right: button_left + geometry::SEND_BACK_BUTTON_WIDTH,
-                        bottom: state.title_bar_height,
-                    };
-                    let _ = InvalidateRect(hwnd, Some(&btn_rect), FALSE);
-                }
-            }
-            LRESULT(0)
-        }
-
-        WM_MOUSELEAVE => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !ptr.is_null() {
-                let state = &mut *ptr;
-                state.tracking_mouse = false;
-                if state.send_back_hovered {
-                    state.send_back_hovered = false;
-                    let _ = InvalidateRect(hwnd, None, FALSE);
-                }
-            }
-            LRESULT(0)
-        }
-
-        WM_LBUTTONUP => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
-            let tb_height = if !ptr.is_null() { (*ptr).title_bar_height } else { compute_title_bar_height(hwnd) };
-
-            let x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-
-            let mut client_rect = RECT::default();
-            let _ = GetClientRect(hwnd, &mut client_rect);
-            let cw = client_rect.right - client_rect.left;
-
-            if is_in_send_back_button(hwnd, x, y, cw, tb_height) {
-                // Send window to bottom of Z-order
-                let _ = SetWindowPos(
-                    hwnd,
-                    HWND_BOTTOM,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-            LRESULT(0)
-        }
-
+        WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEMOVE => on_mouse_move(hwnd, lparam),
+        WM_MOUSELEAVE => on_mouse_leave(hwnd),
+        WM_LBUTTONUP => on_lbutton_up(hwnd, lparam),
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-/// Returns the width of DWM-drawn caption buttons (close + maximize + disabled minimize).
-unsafe fn get_caption_buttons_width(hwnd: HWND) -> i32 {
+unsafe fn on_create(hwnd: HWND) -> LRESULT {
+    let title_bar_height = compute_title_bar_height(hwnd);
+
+    // Use client area for the capture buffer. WM_NCCALCSIZE has not yet
+    // collapsed the standard frame at this point, but the bitmap will be
+    // resized via WM_SIZE before the first paint.
+    let mut client_rect = RECT::default();
+    let _ = GetClientRect(hwnd, &mut client_rect);
+    let cw = (client_rect.right - client_rect.left).max(1);
+    let ch = (client_rect.bottom - client_rect.top).max(1);
+    let content_height = (ch - title_bar_height).max(1);
+
+    let cap_state = CaptureState::new(hwnd, cw, content_height);
+
+    let state = Box::new(WindowState {
+        capture: cap_state,
+        render_cache: RenderCache::default(),
+        send_back_hovered: false,
+        tracking_mouse: false,
+        title_bar_height,
+    });
+
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+    LRESULT(0)
+}
+
+unsafe fn on_destroy(hwnd: HWND) -> LRESULT {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+    if !ptr.is_null() {
+        // Drop the boxed state; CaptureState::drop releases GDI handles and
+        // kills the timer while the HWND is still valid.
+        drop(Box::from_raw(ptr));
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    }
+    PostQuitMessage(0);
+    LRESULT(0)
+}
+
+unsafe fn on_timer(hwnd: HWND) -> LRESULT {
+    with_state(hwnd, |state| {
+        state.capture.capture_frame();
+    });
+    LRESULT(0)
+}
+
+unsafe fn on_paint(hwnd: HWND) -> LRESULT {
+    let dpi = GetDpiForWindow(hwnd);
+    let painted = with_state(hwnd, |state| {
+        render::paint(
+            hwnd,
+            &state.capture,
+            &mut state.render_cache,
+            state.send_back_hovered,
+            state.title_bar_height,
+            dpi,
+        );
+    });
+    if painted.is_none() {
+        let mut ps = PAINTSTRUCT::default();
+        let _ = BeginPaint(hwnd, &mut ps);
+        let _ = EndPaint(hwnd, &ps);
+    }
+    LRESULT(0)
+}
+
+unsafe fn on_size(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    // `WM_SIZE` packs unsigned WORDs; sign-extension would silently drop
+    // resizes wider than 32767 pixels.
+    let (width, height) = lparam_to_size(lparam);
+    with_state(hwnd, |state| {
+        let content_height = height - state.title_bar_height;
+        if width > 0 && content_height > 0 {
+            state.capture.resize(width, content_height);
+            if !state.capture.paused() {
+                state.capture.capture_frame();
+            }
+        }
+    });
+    LRESULT(0)
+}
+
+unsafe fn on_nc_hit_test(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let (x, y) = lparam_to_xy(lparam);
+
+    let mut rect = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rect);
+
+    let margin = geometry::RESIZE_MARGIN;
+    let caption_buttons_width = caption_buttons_width(hwnd);
+    let tb_height = with_state(hwnd, |s| s.title_bar_height)
+        .unwrap_or_else(|| compute_title_bar_height(hwnd));
+
+    // The DWM caption buttons live in the top-right strip (within the title
+    // bar height). Suppress border resize hits there so the close/maximize
+    // buttons remain clickable; everywhere else the right edge resizes.
+    let in_caption_buttons_strip =
+        x >= rect.right - caption_buttons_width && y < rect.top + tb_height;
+
+    if y < rect.top + margin && !in_caption_buttons_strip {
+        if x < rect.left + margin {
+            return LRESULT(HTTOPLEFT as isize);
+        }
+        if x >= rect.right - margin {
+            return LRESULT(HTTOPRIGHT as isize);
+        }
+        return LRESULT(HTTOP as isize);
+    }
+    if y >= rect.bottom - margin {
+        if x < rect.left + margin {
+            return LRESULT(HTBOTTOMLEFT as isize);
+        }
+        if x >= rect.right - margin {
+            return LRESULT(HTBOTTOMRIGHT as isize);
+        }
+        return LRESULT(HTBOTTOM as isize);
+    }
+    if x < rect.left + margin {
+        return LRESULT(HTLEFT as isize);
+    }
+    if x >= rect.right - margin && !in_caption_buttons_strip {
+        return LRESULT(HTRIGHT as isize);
+    }
+
+    if y < rect.top + tb_height {
+        // "Send to Back" button — left of the DWM caption buttons.
+        let client_width = rect.right - rect.left;
+        let client_x = x - rect.left;
+        let (button_left, button_right) =
+            geometry::send_back_button_range(client_width, caption_buttons_width);
+        if client_x >= button_left && client_x < button_right {
+            return LRESULT(HTCLIENT as isize);
+        }
+
+        // Let DWM check if cursor is over a caption button (close/max).
+        let mut dwm_result = LRESULT(0);
+        if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool() {
+            return dwm_result;
+        }
+
+        return LRESULT(HTCAPTION as isize);
+    }
+
+    LRESULT(HTCLIENT as isize)
+}
+
+unsafe fn on_dpi_changed(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    // Recompute title-bar metrics; refresh the extended frame and any
+    // DPI-dependent render cache.
+    with_state(hwnd, |state| {
+        state.title_bar_height = compute_title_bar_height(hwnd);
+        state.render_cache.invalidate_dpi_dependent();
+    });
+    apply_extended_frame(hwnd);
+
+    // Use the suggested rect from lparam to reposition for the new DPI.
+    let suggested = lparam.0 as *const RECT;
+    if !suggested.is_null() {
+        let r = &*suggested;
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    let _ = InvalidateRect(hwnd, None, FALSE);
+    LRESULT(0)
+}
+
+unsafe fn on_mouse_move(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let (x, y) = lparam_to_xy(lparam);
+    let mut client_rect = RECT::default();
+    let _ = GetClientRect(hwnd, &mut client_rect);
+    let cw = client_rect.right - client_rect.left;
+    let cap_w = caption_buttons_width(hwnd);
+
+    with_state(hwnd, |state| {
+        if !state.tracking_mouse {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
+            state.tracking_mouse = true;
+        }
+
+        let hovered = geometry::point_in_send_back_button(x, y, cw, state.title_bar_height, cap_w);
+        if hovered != state.send_back_hovered {
+            state.send_back_hovered = hovered;
+            let (button_left, button_right) = geometry::send_back_button_range(cw, cap_w);
+            let btn_rect = RECT {
+                left: button_left,
+                top: 0,
+                right: button_right,
+                bottom: state.title_bar_height,
+            };
+            let _ = InvalidateRect(hwnd, Some(&btn_rect), FALSE);
+        }
+    });
+    LRESULT(0)
+}
+
+unsafe fn on_mouse_leave(hwnd: HWND) -> LRESULT {
+    with_state(hwnd, |state| {
+        state.tracking_mouse = false;
+        if state.send_back_hovered {
+            state.send_back_hovered = false;
+            let _ = InvalidateRect(hwnd, None, FALSE);
+        }
+    });
+    LRESULT(0)
+}
+
+unsafe fn on_lbutton_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let tb_height = with_state(hwnd, |s| s.title_bar_height)
+        .unwrap_or_else(|| compute_title_bar_height(hwnd));
+
+    let (x, y) = lparam_to_xy(lparam);
+    let mut client_rect = RECT::default();
+    let _ = GetClientRect(hwnd, &mut client_rect);
+    let cw = client_rect.right - client_rect.left;
+    let cap_w = caption_buttons_width(hwnd);
+
+    if geometry::point_in_send_back_button(x, y, cw, tb_height, cap_w) {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_BOTTOM,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+    LRESULT(0)
+}
+
+/// Returns the width of DWM-drawn caption buttons (close + maximize +
+/// disabled minimize), falling back to a constant if the API fails.
+unsafe fn caption_buttons_width(hwnd: HWND) -> i32 {
     let mut buttons_rect = RECT::default();
     let result = DwmGetWindowAttribute(
         hwnd,
@@ -496,18 +557,6 @@ unsafe fn get_caption_buttons_width(hwnd: HWND) -> i32 {
     if result.is_ok() {
         buttons_rect.right - buttons_rect.left
     } else {
-        // Fallback: typical width for 3 caption buttons at 100% DPI
-        138
+        geometry::DEFAULT_CAPTION_BUTTONS_WIDTH
     }
-}
-
-/// Returns true if the given client-relative point is inside the "Send to Back" button.
-unsafe fn is_in_send_back_button(hwnd: HWND, x: i32, y: i32, client_width: i32, title_bar_height: i32) -> bool {
-    if y >= title_bar_height {
-        return false;
-    }
-    let caption_buttons_width = get_caption_buttons_width(hwnd);
-    let button_left = client_width - caption_buttons_width - geometry::SEND_BACK_BUTTON_WIDTH;
-    let button_right = button_left + geometry::SEND_BACK_BUTTON_WIDTH;
-    x >= button_left && x < button_right
 }

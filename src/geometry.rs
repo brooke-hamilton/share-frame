@@ -29,6 +29,43 @@ pub const MIN_HEIGHT: i32 = 150;
 pub const SEND_BACK_BUTTON_WIDTH: i32 = 46;
 /// Resize border width for hit testing.
 pub const RESIZE_MARGIN: i32 = 8;
+/// Fallback width for the three DWM caption buttons at 100% DPI when
+/// `DwmGetWindowAttribute(DWMWA_CAPTION_BUTTON_BOUNDS)` is unavailable.
+pub const DEFAULT_CAPTION_BUTTONS_WIDTH: i32 = 138;
+/// Spacing in pixels between grid lines drawn over the captured frame.
+pub const GRID_SPACING: i32 = 48;
+/// Constant alpha used for the grid overlay (~10%).
+pub const GRID_ALPHA: u8 = 25;
+/// Title-bar font height in logical pixels (negative = character height).
+pub const TITLE_FONT_HEIGHT: i32 = -12;
+/// Pixel size of the small window icon shown in the custom title bar.
+pub const TITLE_ICON_SIZE: i32 = 16;
+/// Horizontal inset for the title-bar icon.
+pub const TITLE_ICON_INSET: i32 = 8;
+
+/// Returns the inclusive-exclusive horizontal range of the "Send to Back"
+/// button, expressed as `(left, right)` in client coordinates.
+pub fn send_back_button_range(client_width: i32, caption_buttons_width: i32) -> (i32, i32) {
+    let right = client_width - caption_buttons_width;
+    let left = right - SEND_BACK_BUTTON_WIDTH;
+    (left, right)
+}
+
+/// Returns true when `(x, y)` (client coordinates) hits the "Send to Back"
+/// button drawn left of the DWM caption buttons.
+pub fn point_in_send_back_button(
+    x: i32,
+    y: i32,
+    client_width: i32,
+    title_bar_height: i32,
+    caption_buttons_width: i32,
+) -> bool {
+    if y < 0 || y >= title_bar_height {
+        return false;
+    }
+    let (left, right) = send_back_button_range(client_width, caption_buttons_width);
+    x >= left && x < right
+}
 
 // --- Pure Functions ---
 
@@ -213,5 +250,39 @@ mod tests {
     fn dpi_round_trip_144() {
         let v = 100;
         assert_eq!(physical_to_logical(logical_to_physical(v, 144), 144), v);
+    }
+
+    // --- send-to-back button geometry ---
+
+    #[test]
+    fn send_back_button_range_is_left_of_caption_buttons() {
+        let (left, right) = send_back_button_range(800, 138);
+        assert_eq!(right, 800 - 138);
+        assert_eq!(left, right - SEND_BACK_BUTTON_WIDTH);
+    }
+
+    #[test]
+    fn point_in_send_back_button_inside() {
+        let cw = 800;
+        let cap = 138;
+        let (left, _) = send_back_button_range(cw, cap);
+        assert!(point_in_send_back_button(left + 1, 5, cw, 30, cap));
+    }
+
+    #[test]
+    fn point_in_send_back_button_negative_y_is_outside() {
+        assert!(!point_in_send_back_button(700, -1, 800, 30, 138));
+    }
+
+    #[test]
+    fn point_in_send_back_button_below_title_bar_is_outside() {
+        assert!(!point_in_send_back_button(700, 30, 800, 30, 138));
+    }
+
+    #[test]
+    fn point_in_send_back_button_inside_caption_buttons_is_outside() {
+        let cw = 800;
+        let cap = 138;
+        assert!(!point_in_send_back_button(cw - 10, 5, cw, 30, cap));
     }
 }
