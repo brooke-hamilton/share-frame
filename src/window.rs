@@ -359,13 +359,46 @@ unsafe extern "system" fn wnd_proc(
         WM_TIMER => on_timer(hwnd),
         WM_PAINT => on_paint(hwnd),
         WM_SIZE => on_size(hwnd, lparam),
+        WM_MOVE => {
+            // `WM_MOVE` fires synchronously on every drag tick during a
+            // user move (just like `WM_SIZE` during resize). Capturing here
+            // — instead of waiting for the next 33 ms `WM_TIMER` — keeps
+            // the content area aligned to the desktop in real time, so the
+            // image no longer appears to slide behind the window while
+            // dragging.
+            //
+            // Coalesce against pending paints: if `GetUpdateRect` reports
+            // a non-empty update region, the prior captured frame hasn't
+            // been displayed yet. Doing another `BitBlt` would just
+            // overwrite it with no visible effect, so skip the capture and
+            // let the queued `WM_PAINT` consume the existing frame. The
+            // next `WM_MOVE` (or `WM_TIMER`) will recapture for the new
+            // position. This caps capture work at one `BitBlt` per actual
+            // displayed frame instead of one per OS-delivered move tick.
+            let mut update = RECT::default();
+            let has_pending_paint =
+                GetUpdateRect(hwnd, Some(&mut update), FALSE).as_bool();
+            if !has_pending_paint {
+                with_state(hwnd, |state| {
+                    state.capture.capture_frame();
+                });
+            }
+            LRESULT(0)
+        }
         WM_ENTERSIZEMOVE => {
-            with_state(hwnd, |state| state.capture.pause());
+            // Set `WDA_EXCLUDEFROMCAPTURE` and flush DWM once for the
+            // duration of the modal move/size loop. Per-frame captures
+            // during the loop then skip the affinity toggle and the
+            // `DwmFlush` that follows it — saving ~16 ms per drag tick.
+            with_state(hwnd, |state| state.capture.begin_interactive());
             LRESULT(0)
         }
         WM_EXITSIZEMOVE => {
+            // Modal move/size loop ended; restore affinity so screen-share
+            // apps can see us again, then force a final frame so the last
+            // post-release position/size is correct.
             with_state(hwnd, |state| {
-                state.capture.resume();
+                state.capture.end_interactive();
                 state.capture.capture_frame();
             });
             LRESULT(0)

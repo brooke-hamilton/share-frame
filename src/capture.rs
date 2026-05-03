@@ -33,6 +33,13 @@ pub struct CaptureState {
     /// interactive resize/move). The painter continues to display the last
     /// captured frame, stretched to fit the current client size.
     paused: bool,
+    /// When `true`, `capture_frame` skips the per-frame
+    /// `SetWindowDisplayAffinity` toggle and the `DwmFlush` that follows
+    /// it. Used during interactive move/size, where affinity is set once
+    /// up-front (in [`begin_interactive`]) and restored once at the end
+    /// (in [`end_interactive`]) so we don't pay the ~16 ms compositor
+    /// wait on every drag tick.
+    interactive: bool,
 }
 
 impl CaptureState {
@@ -65,6 +72,7 @@ impl CaptureState {
                 capture_ok: true,
                 affinity_supported: true,
                 paused: false,
+                interactive: false,
             }
         }
     }
@@ -96,13 +104,49 @@ impl CaptureState {
     }
 
     /// Suspends timer-driven capture (call on `WM_ENTERSIZEMOVE`).
+    #[allow(dead_code)]
     pub fn pause(&mut self) {
         self.paused = true;
     }
 
     /// Resumes timer-driven capture (call on `WM_EXITSIZEMOVE`).
+    #[allow(dead_code)]
     pub fn resume(&mut self) {
         self.paused = false;
+    }
+
+    /// Enters interactive mode for the duration of a modal move/size
+    /// loop. Sets `WDA_EXCLUDEFROMCAPTURE` and waits once for DWM to
+    /// composite a frame with the new affinity so subsequent
+    /// `capture_frame` calls (which fire on every `WM_MOVE` / `WM_SIZE`
+    /// tick during the loop) can skip both the per-frame affinity toggle
+    /// and the per-frame `DwmFlush`. The flush alone blocks the calling
+    /// thread for ~16 ms at 60 Hz, so eliminating it from the drag tick
+    /// is the single largest latency win available here.
+    pub fn begin_interactive(&mut self) {
+        // SAFETY: `hwnd` is valid for the lifetime of `self` and
+        // affinity / flush are simple Win32 calls.
+        unsafe {
+            if self.affinity_supported
+                && SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok()
+            {
+                let _ = DwmFlush();
+                self.interactive = true;
+            }
+        }
+    }
+
+    /// Exits interactive mode and restores `WDA_NONE` so screen-share
+    /// applications can capture the window again. Call from
+    /// `WM_EXITSIZEMOVE`.
+    pub fn end_interactive(&mut self) {
+        // SAFETY: Plain Win32 call on an owned `hwnd`.
+        unsafe {
+            if self.interactive {
+                let _ = SetWindowDisplayAffinity(self.hwnd, WDA_NONE);
+                self.interactive = false;
+            }
+        }
     }
 
     /// Captures the desktop region behind the window into the off-screen
@@ -132,7 +176,13 @@ impl CaptureState {
                 return self.capture_ok;
             }
 
-            if self.affinity_supported {
+            // Outside an interactive move/size loop we have to set
+            // affinity, wait for DWM to composite, then restore it. Inside
+            // the loop, `begin_interactive` already did this once and
+            // `end_interactive` will restore it on `WM_EXITSIZEMOVE`, so
+            // we can skip both the toggle and the `DwmFlush`.
+            let manage_affinity = self.affinity_supported && !self.interactive;
+            if manage_affinity {
                 if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_err() {
                     self.affinity_supported = false;
                 } else {
@@ -146,7 +196,7 @@ impl CaptureState {
             let desktop_dc = GetDC(None);
             if desktop_dc.is_invalid() {
                 self.capture_ok = false;
-                if self.affinity_supported {
+                if manage_affinity {
                     let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
                 }
                 return false;
@@ -178,7 +228,7 @@ impl CaptureState {
 
             let _ = ReleaseDC(None, desktop_dc);
 
-            if self.affinity_supported {
+            if manage_affinity {
                 let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
             }
 
@@ -189,8 +239,22 @@ impl CaptureState {
             // (e.g. transitioning into the error-fill state). Skipping the
             // repaint on a steady-state failure avoids needlessly re-running
             // the renderer 30×/sec while capture remains broken.
+            //
+            // Invalidate only the content rect (skipping the synthesized
+            // title bar). This stops the renderer from re-running its
+            // title-bar paint — icon, text, alpha fix-up — on every
+            // captured frame, since `ps.rcPaint` will exclude the title
+            // bar and the renderer can short-circuit accordingly.
             if self.capture_ok || was_ok != self.capture_ok {
-                let _ = InvalidateRect(hwnd, None, false);
+                let mut client_rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client_rect);
+                let content_rect = RECT {
+                    left: client_rect.left,
+                    top: client_rect.top + title_bar_height,
+                    right: client_rect.right,
+                    bottom: client_rect.bottom,
+                };
+                let _ = InvalidateRect(hwnd, Some(&content_rect), false);
             }
             self.capture_ok
         }

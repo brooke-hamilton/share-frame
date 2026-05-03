@@ -69,11 +69,64 @@ impl Drop for CachedFonts {
     }
 }
 
+/// Cached 32-bit DIB-section back-buffer reused across paints. Recreated
+/// only when the client size changes — avoids per-frame `CreateDIBSection`
+/// (which allocates `width * height * 4` bytes from the GDI heap) plus the
+/// matching DC create/select/delete dance.
+struct BackBuffer {
+    dc: HDC,
+    bitmap: HBITMAP,
+    /// Bitmap originally selected into `dc`; re-selected before deletion.
+    default_bitmap: HGDIOBJ,
+    /// Pointer to the DIB pixel bits (used by `fix_title_bar_alpha`).
+    bits: *mut std::ffi::c_void,
+    width: i32,
+    height: i32,
+}
+
+impl BackBuffer {
+    /// Creates a top-down 32-bit BGRA DIB section sized `width x height`.
+    /// `screen_hdc` is used as the compatibility source and is not retained.
+    unsafe fn new(screen_hdc: HDC, width: i32, height: i32) -> Option<Self> {
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dc = CreateCompatibleDC(screen_hdc);
+        let bitmap =
+            CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let default_bitmap = SelectObject(dc, bitmap);
+        Some(Self { dc, bitmap, default_bitmap, bits, width, height })
+    }
+}
+
+impl Drop for BackBuffer {
+    fn drop(&mut self) {
+        // SAFETY: Re-select the original bitmap before deleting our DIB so
+        // GDI doesn't leak the bitmap, then release the DC.
+        unsafe {
+            SelectObject(self.dc, self.default_bitmap);
+            let _ = DeleteObject(self.bitmap);
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
 /// Per-window cache of resources reused across paints. Owned by the window
 /// state; invalidated when DPI changes.
 #[derive(Default)]
 pub struct RenderCache {
     fonts: Option<CachedFonts>,
+    back_buffer: Option<BackBuffer>,
 }
 
 impl RenderCache {
@@ -87,6 +140,27 @@ impl RenderCache {
             self.fonts = Some(CachedFonts::create(dpi));
         }
         self.fonts.as_ref().expect("fonts populated above")
+    }
+
+    /// Returns a back-buffer matching `width x height`, recreating it only
+    /// when the dimensions change. Returns `None` if DIB allocation fails.
+    unsafe fn back_buffer_for(
+        &mut self,
+        screen_hdc: HDC,
+        width: i32,
+        height: i32,
+    ) -> Option<&BackBuffer> {
+        let needs_new = match &self.back_buffer {
+            Some(b) => b.width != width || b.height != height,
+            None => true,
+        };
+        if needs_new {
+            // Drop the old buffer before allocating the new one so we don't
+            // hold two full-window DIBs in memory simultaneously.
+            self.back_buffer = None;
+            self.back_buffer = BackBuffer::new(screen_hdc, width, height);
+        }
+        self.back_buffer.as_ref()
     }
 }
 
@@ -120,53 +194,71 @@ pub fn paint(
 
         // 32-bit DIB section so we can manipulate the alpha channel; DWM
         // treats alpha=0 in the extended frame region as transparent glass.
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: cw,
-                biHeight: -ch, // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
+        // Cached on `RenderCache` and reused as long as the client size is
+        // unchanged, so a steady-state drag/resize doesn't churn the GDI
+        // heap with a fresh `width * height * 4` allocation per frame.
+        let Some(back) = cache.back_buffer_for(screen_hdc, cw, ch) else {
+            let _ = EndPaint(hwnd, &ps);
+            return;
         };
-        let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let buf_dc = CreateCompatibleDC(screen_hdc);
-        let buf_bmp = CreateDIBSection(buf_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
-            .unwrap_or_default();
-        let old_bmp = SelectObject(buf_dc, buf_bmp);
+        let buf_dc = back.dc;
+        let bits_ptr = back.bits;
 
         let caption_buttons_width = caption_buttons_width(hwnd);
         let content_height = ch - title_bar_height;
 
-        paint_title_bar(
-            buf_dc,
-            cache,
-            cw,
-            title_bar_height,
-            caption_buttons_width,
-            send_back_hovered,
-            dpi,
-            hwnd,
-            theme,
-        );
+        // Skip per-region work when `ps.rcPaint` doesn't touch it. This
+        // keeps capture-driven repaints (which invalidate only the content
+        // rect) from re-running the title-bar drawing — icon, text, alpha
+        // fix-up — on every frame, and conversely keeps title-bar-only
+        // invalidations (e.g. button hover) from re-blitting the captured
+        // content.
+        let dirty = ps.rcPaint;
+        let title_dirty = dirty.top < title_bar_height;
+        let content_dirty = content_height > 0 && dirty.bottom > title_bar_height;
 
-        fix_title_bar_alpha(bits_ptr, cw, title_bar_height, caption_buttons_width);
+        if title_dirty {
+            paint_title_bar(
+                buf_dc,
+                cache,
+                cw,
+                title_bar_height,
+                caption_buttons_width,
+                send_back_hovered,
+                dpi,
+                hwnd,
+                theme,
+            );
 
-        if content_height > 0 {
+            fix_title_bar_alpha(bits_ptr, cw, title_bar_height, caption_buttons_width);
+        }
+
+        if content_dirty {
             paint_content(buf_dc, state, cw, content_height, title_bar_height);
             paint_grid_overlay(buf_dc, cw, content_height, title_bar_height);
         }
 
-        // Blit composed frame to screen.
-        let _ = BitBlt(screen_hdc, 0, 0, cw, ch, buf_dc, 0, 0, SRCCOPY);
+        // Blit only the dirty region. GDI would clip a full-window BitBlt
+        // to `ps.rcPaint` anyway, but bounding the source rect keeps the
+        // copy proportional to what actually changed.
+        let dw = dirty.right - dirty.left;
+        let dh = dirty.bottom - dirty.top;
+        if dw > 0 && dh > 0 {
+            let _ = BitBlt(
+                screen_hdc,
+                dirty.left,
+                dirty.top,
+                dw,
+                dh,
+                buf_dc,
+                dirty.left,
+                dirty.top,
+                SRCCOPY,
+            );
+        }
 
-        SelectObject(buf_dc, old_bmp);
-        let _ = DeleteObject(buf_bmp);
-        let _ = DeleteDC(buf_dc);
-
+        // Back-buffer DC, bitmap, and bits stay alive on `cache` for the
+        // next paint; nothing to release here.
         let _ = EndPaint(hwnd, &ps);
     }
 }
