@@ -3,6 +3,7 @@
 mod capture;
 mod geometry;
 mod render;
+mod settings;
 mod tray;
 mod window;
 
