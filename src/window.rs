@@ -455,10 +455,18 @@ unsafe extern "system" fn wnd_proc(
     }
 
     // Let DWM handle caption-button interactions for everything except the
-    // messages we own (frame layout and client-area mouse handling).
+    // messages we own (frame layout, client-area mouse handling, and the
+    // close path — we want to intercept WM_CLOSE / SC_CLOSE before DWM or
+    // DefWindowProc destroy the window, so the tray icon survives).
     if !matches!(
         msg,
-        WM_NCHITTEST | WM_NCCALCSIZE | WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONUP
+        WM_NCHITTEST
+            | WM_NCCALCSIZE
+            | WM_MOUSEMOVE
+            | WM_MOUSELEAVE
+            | WM_LBUTTONUP
+            | WM_CLOSE
+            | WM_SYSCOMMAND
     ) {
         let mut dwm_result = LRESULT(0);
         if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool() {
@@ -468,9 +476,22 @@ unsafe extern "system" fn wnd_proc(
 
     match msg {
         WM_CREATE => on_create(hwnd),
+        WM_SYSCOMMAND => {
+            // The DWM caption × button generates WM_SYSCOMMAND with
+            // wparam == SC_CLOSE (low 4 bits of wparam are reserved by
+            // Windows, so mask them off per MSDN). Hide instead of close.
+            // All other system commands (move, size, minimize, restore,
+            // keyboard shortcuts) get default handling.
+            let cmd = (wparam.0 as u32) & 0xFFF0;
+            if cmd == SC_CLOSE {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_CLOSE => {
-            // Clicking the DWM caption × button (or Alt+F4) sends WM_CLOSE.
-            // Hide the window instead of destroying it; the tray icon
+            // Alt+F4 (and any code path that sends WM_CLOSE directly) lands
+            // here. Hide the window instead of destroying it; the tray icon
             // keeps the process alive and the user reopens via the tray
             // menu. Returning 0 (without calling DefWindowProcW) suppresses
             // the default DestroyWindow behavior.
