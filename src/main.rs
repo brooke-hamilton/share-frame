@@ -3,6 +3,7 @@
 mod capture;
 mod geometry;
 mod render;
+mod tray;
 mod window;
 
 use windows::core::*;

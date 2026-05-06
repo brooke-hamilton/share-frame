@@ -16,6 +16,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 /// same value for the same string across the whole session, so any caller
 /// (including a second instance of this process) gets the same id.
 static SHOW_WINDOW_MSG: AtomicU32 = AtomicU32::new(0);
+/// Registered exit message id; the tray's Exit menu posts this so the
+/// main window can run its normal destroy/cleanup path.
+static EXIT_APP_MSG: AtomicU32 = AtomicU32::new(0);
 
 /// Returns the registered window message that asks the existing instance to
 /// restore + foreground its window. Lazily registered on first call.
@@ -34,9 +37,22 @@ pub fn show_window_message() -> u32 {
     id
 }
 
+/// Returns the registered window message that asks the main window to
+/// fully exit (destroy itself, which triggers WM_DESTROY cleanup).
+pub fn exit_app_message() -> u32 {
+    let cached = EXIT_APP_MSG.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let id = unsafe { RegisterWindowMessageW(w!("ShareFrame_ExitApp_v1")) };
+    EXIT_APP_MSG.store(id, Ordering::Relaxed);
+    id
+}
+
 use crate::capture::CaptureState;
 use crate::geometry;
 use crate::render::{self, RenderCache, TitleBarTheme};
+use crate::tray;
 
 /// Per-window state. Owned via `Box` and stored in `GWLP_USERDATA`.
 struct WindowState {
@@ -46,6 +62,10 @@ struct WindowState {
     tracking_mouse: bool,
     title_bar_height: i32,
     is_active: bool,
+    /// Hidden message-only window owning the tray icon. `HWND::default()`
+    /// until `tray::install` succeeds. Cleaned up in WM_DESTROY before
+    /// `PostQuitMessage`.
+    tray_hwnd: HWND,
 }
 
 const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
@@ -274,6 +294,16 @@ pub fn create_and_run(start_hidden: bool) -> windows::core::Result<()> {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
 
+        // Install the tray icon. Use the small icon for the notification
+        // area. Failure here is non-fatal: the user can still use the
+        // window directly via the taskbar (when visible). We do not show
+        // an error dialog because the tray is a convenience feature.
+        let tray_hwnd = tray::install(hwnd, HICON(icon_sm.0)).unwrap_or_default();
+        // Stash the tray HWND on the main window so WM_DESTROY can clean
+        // it up. WM_CREATE has already run by this point and constructed
+        // the WindowState; mutate that state in place.
+        with_state(hwnd, |state| state.tray_hwnd = tray_hwnd);
+
         if hwnd == HWND::default() {
             return Err(Error::from_win32());
         }
@@ -394,6 +424,13 @@ unsafe extern "system" fn wnd_proc(
     let show_msg = SHOW_WINDOW_MSG.load(Ordering::Relaxed);
     if show_msg != 0 && msg == show_msg {
         restore_and_foreground(hwnd);
+        return LRESULT(0);
+    }
+    // Registered "exit app" message from the tray's Exit menu item.
+    let exit_msg = EXIT_APP_MSG.load(Ordering::Relaxed);
+    if exit_msg != 0 && msg == exit_msg {
+        // Triggers WM_DESTROY which tears down the tray and posts WM_QUIT.
+        let _ = DestroyWindow(hwnd);
         return LRESULT(0);
     }
 
@@ -538,6 +575,7 @@ unsafe fn on_create(hwnd: HWND) -> LRESULT {
         title_bar_height,
         // Newly created top-level windows are activated by the OS.
         is_active: true,
+        tray_hwnd: HWND::default(),
     });
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -547,6 +585,12 @@ unsafe fn on_create(hwnd: HWND) -> LRESULT {
 unsafe fn on_destroy(hwnd: HWND) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
     if !ptr.is_null() {
+        // Tear down the tray icon BEFORE dropping the box, so the tray's
+        // wnd_proc can no longer post messages to a window whose state is
+        // gone. `tray::shutdown` is a no-op for a default HWND.
+        let tray_hwnd = (*ptr).tray_hwnd;
+        tray::shutdown(tray_hwnd);
+
         // Drop the boxed state; CaptureState::drop releases GDI handles and
         // kills the timer while the HWND is still valid.
         drop(Box::from_raw(ptr));
