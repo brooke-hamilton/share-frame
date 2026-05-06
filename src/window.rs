@@ -1,4 +1,5 @@
 use std::mem;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -10,6 +11,28 @@ use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// Cached registered window message id. `RegisterWindowMessageW` returns the
+/// same value for the same string across the whole session, so any caller
+/// (including a second instance of this process) gets the same id.
+static SHOW_WINDOW_MSG: AtomicU32 = AtomicU32::new(0);
+
+/// Returns the registered window message that asks the existing instance to
+/// restore + foreground its window. Lazily registered on first call.
+/// Returns `0` if registration failed (caller should treat as no-op).
+pub fn show_window_message() -> u32 {
+    let cached = SHOW_WINDOW_MSG.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    // SAFETY: `RegisterWindowMessageW` is thread-safe and returns the same
+    // id for the same null-terminated wide string. Racing callers may both
+    // register; the OS deduplicates by string, so storing either result is
+    // correct.
+    let id = unsafe { RegisterWindowMessageW(w!("ShareFrame_ShowWindow_v1")) };
+    SHOW_WINDOW_MSG.store(id, Ordering::Relaxed);
+    id
+}
 
 use crate::capture::CaptureState;
 use crate::geometry;
@@ -156,7 +179,11 @@ fn tint_color(r: u8, g: u8, b: u8, delta: i32) -> COLORREF {
 }
 
 /// Creates the window and runs the Win32 message loop.
-pub fn create_and_run() -> windows::core::Result<()> {
+///
+/// `start_hidden = true` creates the window without `WS_VISIBLE`, leaving
+/// only the tray icon onscreen. The window can later be shown by sending
+/// `show_window_message()` to it.
+pub fn create_and_run(start_hidden: bool) -> windows::core::Result<()> {
     // SAFETY: Standard Win32 window registration / message loop. All handles
     // are owned by the OS for the lifetime of the process or by the window
     // state via `Drop`.
@@ -212,11 +239,24 @@ pub fn create_and_run() -> windows::core::Result<()> {
         let size = geometry::default_size(monitor_width, monitor_height);
         let pos = geometry::centered_position(size, work_area);
 
+        // Always include `WS_VISIBLE` in the style bits so subsequent
+        // `ShowWindow(SW_SHOW)` calls behave as expected; for the
+        // hidden-startup case we just immediately hide the window after
+        // creation. Doing it this way avoids a full second style flip on
+        // first show and keeps DWM frame extension consistent.
+        let style = WS_OVERLAPPED
+            | WS_CAPTION
+            | WS_SYSMENU
+            | WS_THICKFRAME
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX
+            | WS_VISIBLE;
+
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
             CLASS_NAME,
             WINDOW_TITLE,
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
+            style,
             pos.x,
             pos.y,
             size.width,
@@ -226,6 +266,13 @@ pub fn create_and_run() -> windows::core::Result<()> {
             hinstance,
             None,
         )?;
+
+        if start_hidden {
+            // Hide immediately; the tray icon is the only UI surface until
+            // the user clicks Open. `SW_HIDE` removes the window from
+            // Alt+Tab and the taskbar.
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
 
         if hwnd == HWND::default() {
             return Err(Error::from_win32());
@@ -341,6 +388,15 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Registered cross-process "show window" message from the tray icon
+    // or a second-instance launch. Compare against the cached id (non-zero
+    // once registered).
+    let show_msg = SHOW_WINDOW_MSG.load(Ordering::Relaxed);
+    if show_msg != 0 && msg == show_msg {
+        restore_and_foreground(hwnd);
+        return LRESULT(0);
+    }
+
     // Let DWM handle caption-button interactions for everything except the
     // messages we own (frame layout and client-area mouse handling).
     if !matches!(
@@ -355,6 +411,15 @@ unsafe extern "system" fn wnd_proc(
 
     match msg {
         WM_CREATE => on_create(hwnd),
+        WM_CLOSE => {
+            // Clicking the DWM caption × button (or Alt+F4) sends WM_CLOSE.
+            // Hide the window instead of destroying it; the tray icon
+            // keeps the process alive and the user reopens via the tray
+            // menu. Returning 0 (without calling DefWindowProcW) suppresses
+            // the default DestroyWindow behavior.
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            LRESULT(0)
+        }
         WM_DESTROY => on_destroy(hwnd),
         WM_TIMER => on_timer(hwnd),
         WM_PAINT => on_paint(hwnd),
@@ -729,4 +794,41 @@ unsafe fn find_topmost_app_window(exclude: HWND) -> Option<HWND> {
 /// minimize), falling back to a constant if the API fails.
 unsafe fn caption_buttons_width(hwnd: HWND) -> i32 {
     geometry::caption_buttons_width(hwnd)
+}
+
+/// Reliably brings `hwnd` to the foreground, showing it if hidden and
+/// restoring it if minimized. Used by the tray Open command and by a
+/// second-instance launch.
+///
+/// `SetForegroundWindow` alone is unreliable when the calling thread does
+/// not own the foreground. The topmost-then-not-topmost dance is the
+/// well-known Win32 workaround that does not require attaching to the
+/// foreground thread's input queue.
+unsafe fn restore_and_foreground(hwnd: HWND) {
+    if !IsWindowVisible(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+    if IsIconic(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    let _ = SetForegroundWindow(hwnd);
+    let _ = BringWindowToTop(hwnd);
 }
