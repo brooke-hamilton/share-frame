@@ -26,7 +26,8 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 const TRAY_ICON_UID: u32 = 1;
 
 const IDM_OPEN: u32 = 100;
-const IDM_EXIT: u32 = 101;
+const IDM_SETTINGS: u32 = 101;
+const IDM_EXIT: u32 = 102;
 
 /// Cached id of the OS-broadcast `TaskbarCreated` message. Sent to all
 /// top-level windows when explorer.exe restarts; we re-add the icon.
@@ -204,6 +205,7 @@ unsafe extern "system" fn tray_wnd_proc(
             let cmd = (wparam.0 as u32) & 0xFFFF;
             match cmd {
                 IDM_OPEN => post_show(hwnd),
+                IDM_SETTINGS => post_settings(hwnd),
                 IDM_EXIT => post_exit(hwnd),
                 _ => {}
             }
@@ -249,6 +251,22 @@ unsafe fn post_exit(tray_hwnd: HWND) {
     }
 }
 
+unsafe fn post_settings(tray_hwnd: HWND) {
+    if let Some(main) = main_hwnd(tray_hwnd) {
+        let msg = window::show_settings_message();
+        if msg != 0 {
+            // Bring the main window forward so the settings dialog is
+            // owned by a visible parent (avoids a hidden modal).
+            let show = window::show_window_message();
+            if show != 0 {
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+                let _ = PostMessageW(main, show, WPARAM(0), LPARAM(0));
+            }
+            let _ = PostMessageW(main, msg, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 unsafe fn main_hwnd(tray_hwnd: HWND) -> Option<HWND> {
     let p = GetWindowLongPtrW(tray_hwnd, GWLP_USERDATA) as *mut TrayState;
     if p.is_null() { None } else { Some((*p).main_hwnd) }
@@ -265,6 +283,7 @@ unsafe fn show_context_menu(tray_hwnd: HWND) {
     };
 
     let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN as usize, w!("Open"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS as usize, w!("Settings"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, w!("Exit"));
 

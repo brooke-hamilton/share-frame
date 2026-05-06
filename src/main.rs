@@ -4,6 +4,7 @@ mod capture;
 mod geometry;
 mod render;
 mod settings;
+mod settings_dialog;
 mod tray;
 mod window;
 

@@ -19,6 +19,8 @@ static SHOW_WINDOW_MSG: AtomicU32 = AtomicU32::new(0);
 /// Registered exit message id; the tray's Exit menu posts this so the
 /// main window can run its normal destroy/cleanup path.
 static EXIT_APP_MSG: AtomicU32 = AtomicU32::new(0);
+/// Registered show-settings-dialog message id.
+static SHOW_SETTINGS_MSG: AtomicU32 = AtomicU32::new(0);
 
 /// Returns the registered window message that asks the existing instance to
 /// restore + foreground its window. Lazily registered on first call.
@@ -46,6 +48,18 @@ pub fn exit_app_message() -> u32 {
     }
     let id = unsafe { RegisterWindowMessageW(w!("ShareFrame_ExitApp_v1")) };
     EXIT_APP_MSG.store(id, Ordering::Relaxed);
+    id
+}
+
+/// Returns the registered window message that asks the main window to
+/// open the settings dialog.
+pub fn show_settings_message() -> u32 {
+    let cached = SHOW_SETTINGS_MSG.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let id = unsafe { RegisterWindowMessageW(w!("ShareFrame_ShowSettings_v1")) };
+    SHOW_SETTINGS_MSG.store(id, Ordering::Relaxed);
     id
 }
 
@@ -431,6 +445,12 @@ unsafe extern "system" fn wnd_proc(
     if exit_msg != 0 && msg == exit_msg {
         // Triggers WM_DESTROY which tears down the tray and posts WM_QUIT.
         let _ = DestroyWindow(hwnd);
+        return LRESULT(0);
+    }
+    // Registered "show settings dialog" message from the tray menu.
+    let settings_msg = SHOW_SETTINGS_MSG.load(Ordering::Relaxed);
+    if settings_msg != 0 && msg == settings_msg {
+        crate::settings_dialog::show(hwnd);
         return LRESULT(0);
     }
 
