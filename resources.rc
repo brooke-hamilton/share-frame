@@ -1,6 +1,12 @@
 // Application icon — ID 1 is the default icon Windows uses for the exe.
 1 ICON "assets\\icons\\share-frame.ico"
 
+// Side-by-side application manifest. Required for TaskDialogIndirect and
+// other v6 common controls; without it the loader fails with
+// STATUS_ENTRYPOINT_NOT_FOUND on startup. Resource id 1 is
+// CREATEPROCESS_MANIFEST_RESOURCE_ID; type 24 is RT_MANIFEST.
+1 24 "share-frame.manifest"
+
 // Version information — Task Manager's "Name" column reads FileDescription
 // from this resource. Without it Task Manager falls back to the on-disk
 // filename ("share-frame.exe").
