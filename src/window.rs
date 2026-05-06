@@ -1,4 +1,5 @@
 use std::mem;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -11,9 +12,47 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+/// Cached registered window message id. `RegisterWindowMessageW` returns the
+/// same value for the same string across the whole session, so any caller
+/// (including a second instance of this process) gets the same id.
+static SHOW_WINDOW_MSG: AtomicU32 = AtomicU32::new(0);
+/// Registered exit message id; the tray's Exit menu posts this so the
+/// main window can run its normal destroy/cleanup path.
+static EXIT_APP_MSG: AtomicU32 = AtomicU32::new(0);
+
+/// Returns the registered window message that asks the existing instance to
+/// restore + foreground its window. Lazily registered on first call.
+/// Returns `0` if registration failed (caller should treat as no-op).
+pub fn show_window_message() -> u32 {
+    let cached = SHOW_WINDOW_MSG.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    // SAFETY: `RegisterWindowMessageW` is thread-safe and returns the same
+    // id for the same null-terminated wide string. Racing callers may both
+    // register; the OS deduplicates by string, so storing either result is
+    // correct.
+    let id = unsafe { RegisterWindowMessageW(w!("ShareFrame_ShowWindow_v1")) };
+    SHOW_WINDOW_MSG.store(id, Ordering::Relaxed);
+    id
+}
+
+/// Returns the registered window message that asks the main window to
+/// fully exit (destroy itself, which triggers WM_DESTROY cleanup).
+pub fn exit_app_message() -> u32 {
+    let cached = EXIT_APP_MSG.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let id = unsafe { RegisterWindowMessageW(w!("ShareFrame_ExitApp_v1")) };
+    EXIT_APP_MSG.store(id, Ordering::Relaxed);
+    id
+}
+
 use crate::capture::CaptureState;
 use crate::geometry;
 use crate::render::{self, RenderCache, TitleBarTheme};
+use crate::tray;
 
 /// Per-window state. Owned via `Box` and stored in `GWLP_USERDATA`.
 struct WindowState {
@@ -23,6 +62,10 @@ struct WindowState {
     tracking_mouse: bool,
     title_bar_height: i32,
     is_active: bool,
+    /// Hidden message-only window owning the tray icon. `HWND::default()`
+    /// until `tray::install` succeeds. Cleaned up in WM_DESTROY before
+    /// `PostQuitMessage`.
+    tray_hwnd: HWND,
 }
 
 const CLASS_NAME: PCWSTR = w!("ShareFrameClass");
@@ -156,11 +199,24 @@ fn tint_color(r: u8, g: u8, b: u8, delta: i32) -> COLORREF {
 }
 
 /// Creates the window and runs the Win32 message loop.
-pub fn create_and_run() -> windows::core::Result<()> {
+///
+/// `start_hidden = true` creates the window without `WS_VISIBLE`, leaving
+/// only the tray icon onscreen. The window can later be shown by sending
+/// `show_window_message()` to it.
+pub fn create_and_run(start_hidden: bool) -> windows::core::Result<()> {
     // SAFETY: Standard Win32 window registration / message loop. All handles
     // are owned by the OS for the lifetime of the process or by the window
     // state via `Drop`.
     unsafe {
+        // Eagerly register the cross-process messages so their cached ids
+        // are non-zero before any external sender (a second-instance
+        // launch) can `PostMessageW` them to us. `wnd_proc` short-circuits
+        // when the cached id is 0, so without this the first instance
+        // would silently ignore the show/exit messages until something in
+        // *this* process happened to register them first.
+        let _ = show_window_message();
+        let _ = exit_app_message();
+
         let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
 
         // Load the application icon from embedded resources (ID 1) at both
@@ -212,11 +268,27 @@ pub fn create_and_run() -> windows::core::Result<()> {
         let size = geometry::default_size(monitor_width, monitor_height);
         let pos = geometry::centered_position(size, work_area);
 
+        // Build the window style. Omit `WS_VISIBLE` when starting hidden
+        // so `CreateWindowExW` does not show the window even briefly
+        // before we get a chance to call `SW_HIDE` — critical for the
+        // `--minimized` auto-start path, where any flash on logon is very
+        // visible. The window is later shown with `SW_SHOW`, which works
+        // fine on a window created without `WS_VISIBLE`.
+        let mut style = WS_OVERLAPPED
+            | WS_CAPTION
+            | WS_SYSMENU
+            | WS_THICKFRAME
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX;
+        if !start_hidden {
+            style |= WS_VISIBLE;
+        }
+
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
             CLASS_NAME,
             WINDOW_TITLE,
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
+            style,
             pos.x,
             pos.y,
             size.width,
@@ -227,9 +299,15 @@ pub fn create_and_run() -> windows::core::Result<()> {
             None,
         )?;
 
-        if hwnd == HWND::default() {
-            return Err(Error::from_win32());
-        }
+        // Install the tray icon. Use the small icon for the notification
+        // area. Failure here is non-fatal: the user can still use the
+        // window directly via the taskbar (when visible). We do not show
+        // an error dialog because the tray is a convenience feature.
+        let tray_hwnd = tray::install(hwnd, HICON(icon_sm.0)).unwrap_or_default();
+        // Stash the tray HWND on the main window so WM_DESTROY can clean
+        // it up. WM_CREATE has already run by this point and constructed
+        // the WindowState; mutate that state in place.
+        with_state(hwnd, |state| state.tray_hwnd = tray_hwnd);
 
         apply_dark_mode(hwnd);
         apply_extended_frame(hwnd);
@@ -341,11 +419,35 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Registered cross-process "show window" message from the tray icon
+    // or a second-instance launch. Compare against the cached id (non-zero
+    // once registered).
+    let show_msg = SHOW_WINDOW_MSG.load(Ordering::Relaxed);
+    if show_msg != 0 && msg == show_msg {
+        restore_and_foreground(hwnd);
+        return LRESULT(0);
+    }
+    // Registered "exit app" message from the tray's Exit menu item.
+    let exit_msg = EXIT_APP_MSG.load(Ordering::Relaxed);
+    if exit_msg != 0 && msg == exit_msg {
+        // Triggers WM_DESTROY which tears down the tray and posts WM_QUIT.
+        let _ = DestroyWindow(hwnd);
+        return LRESULT(0);
+    }
+
     // Let DWM handle caption-button interactions for everything except the
-    // messages we own (frame layout and client-area mouse handling).
+    // messages we own (frame layout, client-area mouse handling, and the
+    // close path — we want to intercept WM_CLOSE / SC_CLOSE before DWM or
+    // DefWindowProc destroy the window, so the tray icon survives).
     if !matches!(
         msg,
-        WM_NCHITTEST | WM_NCCALCSIZE | WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONUP
+        WM_NCHITTEST
+            | WM_NCCALCSIZE
+            | WM_MOUSEMOVE
+            | WM_MOUSELEAVE
+            | WM_LBUTTONUP
+            | WM_CLOSE
+            | WM_SYSCOMMAND
     ) {
         let mut dwm_result = LRESULT(0);
         if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool() {
@@ -355,6 +457,40 @@ unsafe extern "system" fn wnd_proc(
 
     match msg {
         WM_CREATE => on_create(hwnd),
+        WM_SYSCOMMAND => {
+            // The DWM caption × button generates WM_SYSCOMMAND with
+            // wparam == SC_CLOSE (low 4 bits of wparam are reserved by
+            // Windows, so mask them off per MSDN). Hide instead of close.
+            // All other system commands (move, size, minimize, restore,
+            // keyboard shortcuts) get default handling.
+            let cmd = (wparam.0 as u32) & 0xFFF0;
+            if cmd == SC_CLOSE {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_CLOSE => {
+            // Alt+F4 (and any code path that sends WM_CLOSE directly) lands
+            // here. Hide the window instead of destroying it; the tray icon
+            // keeps the process alive and the user reopens via the tray
+            // menu. Returning 0 (without calling DefWindowProcW) suppresses
+            // the default DestroyWindow behavior.
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            LRESULT(0)
+        }
+        WM_ENDSESSION => {
+            // Windows is logging off / shutting down (wparam != 0 means
+            // the session really is ending). Run our normal teardown so
+            // the tray icon is removed and any cleanup happens while we
+            // still have time — the OS would otherwise destroy us
+            // without giving WM_DESTROY a chance to fire on a hidden
+            // window via the close path.
+            if wparam.0 != 0 {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => on_destroy(hwnd),
         WM_TIMER => on_timer(hwnd),
         WM_PAINT => on_paint(hwnd),
@@ -473,6 +609,7 @@ unsafe fn on_create(hwnd: HWND) -> LRESULT {
         title_bar_height,
         // Newly created top-level windows are activated by the OS.
         is_active: true,
+        tray_hwnd: HWND::default(),
     });
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -482,6 +619,12 @@ unsafe fn on_create(hwnd: HWND) -> LRESULT {
 unsafe fn on_destroy(hwnd: HWND) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
     if !ptr.is_null() {
+        // Tear down the tray icon BEFORE dropping the box, so the tray's
+        // wnd_proc can no longer post messages to a window whose state is
+        // gone. `tray::shutdown` is a no-op for a default HWND.
+        let tray_hwnd = (*ptr).tray_hwnd;
+        tray::shutdown(tray_hwnd);
+
         // Drop the boxed state; CaptureState::drop releases GDI handles and
         // kills the timer while the HWND is still valid.
         drop(Box::from_raw(ptr));
@@ -729,4 +872,46 @@ unsafe fn find_topmost_app_window(exclude: HWND) -> Option<HWND> {
 /// minimize), falling back to a constant if the API fails.
 unsafe fn caption_buttons_width(hwnd: HWND) -> i32 {
     geometry::caption_buttons_width(hwnd)
+}
+
+/// Reliably brings `hwnd` to the foreground, showing it if hidden and
+/// restoring it if minimized. Used by the tray Open command and by a
+/// second-instance launch.
+///
+/// `SetForegroundWindow` alone is unreliable when the calling thread does
+/// not own the foreground. The topmost-then-not-topmost dance is the
+/// well-known Win32 workaround that does not require attaching to the
+/// foreground thread's input queue.
+unsafe fn restore_and_foreground(hwnd: HWND) {
+    if !IsWindowVisible(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+    if IsIconic(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    let _ = SetForegroundWindow(hwnd);
+    let _ = BringWindowToTop(hwnd);
+    // Final fallback: `SwitchToThisWindow` is undocumented but widely
+    // used and reliably brings a window to the foreground when
+    // `SetForegroundWindow` is denied (e.g. when our process does not
+    // own the foreground at the moment of the call).
+    SwitchToThisWindow(hwnd, TRUE);
 }
