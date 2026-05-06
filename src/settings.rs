@@ -49,13 +49,13 @@ pub fn set_startup_enabled(enabled: bool) -> windows::core::Result<()> {
     // SAFETY: Single-key open + one set/delete call + close.
     unsafe {
         let mut hkey = HKEY::default();
-        // KEY_WRITE is needed to set or delete a value. KEY_READ included
-        // for symmetry; safe to combine.
+        // Both setting and deleting a value require only `KEY_SET_VALUE`;
+        // request the minimum to follow least-privilege even under HKCU.
         let open = RegOpenKeyExW(
             HKEY_CURRENT_USER,
             RUN_KEY,
             0,
-            KEY_READ | KEY_WRITE,
+            KEY_SET_VALUE,
             &mut hkey,
         );
         if open.is_err() {

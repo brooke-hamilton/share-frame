@@ -19,8 +19,6 @@ static SHOW_WINDOW_MSG: AtomicU32 = AtomicU32::new(0);
 /// Registered exit message id; the tray's Exit menu posts this so the
 /// main window can run its normal destroy/cleanup path.
 static EXIT_APP_MSG: AtomicU32 = AtomicU32::new(0);
-/// Registered show-settings-dialog message id.
-static SHOW_SETTINGS_MSG: AtomicU32 = AtomicU32::new(0);
 
 /// Returns the registered window message that asks the existing instance to
 /// restore + foreground its window. Lazily registered on first call.
@@ -48,18 +46,6 @@ pub fn exit_app_message() -> u32 {
     }
     let id = unsafe { RegisterWindowMessageW(w!("ShareFrame_ExitApp_v1")) };
     EXIT_APP_MSG.store(id, Ordering::Relaxed);
-    id
-}
-
-/// Returns the registered window message that asks the main window to
-/// open the settings dialog.
-pub fn show_settings_message() -> u32 {
-    let cached = SHOW_SETTINGS_MSG.load(Ordering::Relaxed);
-    if cached != 0 {
-        return cached;
-    }
-    let id = unsafe { RegisterWindowMessageW(w!("ShareFrame_ShowSettings_v1")) };
-    SHOW_SETTINGS_MSG.store(id, Ordering::Relaxed);
     id
 }
 
@@ -273,18 +259,21 @@ pub fn create_and_run(start_hidden: bool) -> windows::core::Result<()> {
         let size = geometry::default_size(monitor_width, monitor_height);
         let pos = geometry::centered_position(size, work_area);
 
-        // Always include `WS_VISIBLE` in the style bits so subsequent
-        // `ShowWindow(SW_SHOW)` calls behave as expected; for the
-        // hidden-startup case we just immediately hide the window after
-        // creation. Doing it this way avoids a full second style flip on
-        // first show and keeps DWM frame extension consistent.
-        let style = WS_OVERLAPPED
+        // Build the window style. Omit `WS_VISIBLE` when starting hidden
+        // so `CreateWindowExW` does not show the window even briefly
+        // before we get a chance to call `SW_HIDE` — critical for the
+        // `--minimized` auto-start path, where any flash on logon is very
+        // visible. The window is later shown with `SW_SHOW`, which works
+        // fine on a window created without `WS_VISIBLE`.
+        let mut style = WS_OVERLAPPED
             | WS_CAPTION
             | WS_SYSMENU
             | WS_THICKFRAME
             | WS_MINIMIZEBOX
-            | WS_MAXIMIZEBOX
-            | WS_VISIBLE;
+            | WS_MAXIMIZEBOX;
+        if !start_hidden {
+            style |= WS_VISIBLE;
+        }
 
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
@@ -301,13 +290,6 @@ pub fn create_and_run(start_hidden: bool) -> windows::core::Result<()> {
             None,
         )?;
 
-        if start_hidden {
-            // Hide immediately; the tray icon is the only UI surface until
-            // the user clicks Open. `SW_HIDE` removes the window from
-            // Alt+Tab and the taskbar.
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
-
         // Install the tray icon. Use the small icon for the notification
         // area. Failure here is non-fatal: the user can still use the
         // window directly via the taskbar (when visible). We do not show
@@ -317,10 +299,6 @@ pub fn create_and_run(start_hidden: bool) -> windows::core::Result<()> {
         // it up. WM_CREATE has already run by this point and constructed
         // the WindowState; mutate that state in place.
         with_state(hwnd, |state| state.tray_hwnd = tray_hwnd);
-
-        if hwnd == HWND::default() {
-            return Err(Error::from_win32());
-        }
 
         apply_dark_mode(hwnd);
         apply_extended_frame(hwnd);
@@ -447,12 +425,6 @@ unsafe extern "system" fn wnd_proc(
         let _ = DestroyWindow(hwnd);
         return LRESULT(0);
     }
-    // Registered "show settings dialog" message from the tray menu.
-    let settings_msg = SHOW_SETTINGS_MSG.load(Ordering::Relaxed);
-    if settings_msg != 0 && msg == settings_msg {
-        crate::settings_dialog::show(hwnd);
-        return LRESULT(0);
-    }
 
     // Let DWM handle caption-button interactions for everything except the
     // messages we own (frame layout, client-area mouse handling, and the
@@ -496,6 +468,18 @@ unsafe extern "system" fn wnd_proc(
             // menu. Returning 0 (without calling DefWindowProcW) suppresses
             // the default DestroyWindow behavior.
             let _ = ShowWindow(hwnd, SW_HIDE);
+            LRESULT(0)
+        }
+        WM_ENDSESSION => {
+            // Windows is logging off / shutting down (wparam != 0 means
+            // the session really is ending). Run our normal teardown so
+            // the tray icon is removed and any cleanup happens while we
+            // still have time — the OS would otherwise destroy us
+            // without giving WM_DESTROY a chance to fire on a hidden
+            // window via the close path.
+            if wparam.0 != 0 {
+                let _ = DestroyWindow(hwnd);
+            }
             LRESULT(0)
         }
         WM_DESTROY => on_destroy(hwnd),
@@ -916,4 +900,9 @@ unsafe fn restore_and_foreground(hwnd: HWND) {
     );
     let _ = SetForegroundWindow(hwnd);
     let _ = BringWindowToTop(hwnd);
+    // Final fallback: `SwitchToThisWindow` is undocumented but widely
+    // used and reliably brings a window to the foreground when
+    // `SetForegroundWindow` is denied (e.g. when our process does not
+    // own the foreground at the moment of the call).
+    SwitchToThisWindow(hwnd, TRUE);
 }

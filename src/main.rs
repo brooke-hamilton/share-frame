@@ -44,7 +44,16 @@ fn main() {
                     if let Ok(existing) = FindWindowW(w!("ShareFrameClass"), w!("Share Frame")) {
                         let msg = window::show_window_message();
                         if msg != 0 {
-                            let _ = AllowSetForegroundWindow(ASFW_ANY);
+                            // Grant only the existing instance's process
+                            // permission to take focus, rather than the
+                            // process-wide `ASFW_ANY` blanket grant. The
+                            // window must exist for the lookup to work,
+                            // which is guaranteed inside this branch.
+                            let mut pid: u32 = 0;
+                            let _ = GetWindowThreadProcessId(existing, Some(&mut pid));
+                            if pid != 0 {
+                                let _ = AllowSetForegroundWindow(pid);
+                            }
                             let _ = PostMessageW(existing, msg, WPARAM(0), LPARAM(0));
                         }
                     }
