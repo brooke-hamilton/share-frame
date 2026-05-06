@@ -208,6 +208,15 @@ pub fn create_and_run(start_hidden: bool) -> windows::core::Result<()> {
     // are owned by the OS for the lifetime of the process or by the window
     // state via `Drop`.
     unsafe {
+        // Eagerly register the cross-process messages so their cached ids
+        // are non-zero before any external sender (a second-instance
+        // launch) can `PostMessageW` them to us. `wnd_proc` short-circuits
+        // when the cached id is 0, so without this the first instance
+        // would silently ignore the show/exit messages until something in
+        // *this* process happened to register them first.
+        let _ = show_window_message();
+        let _ = exit_app_message();
+
         let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
 
         // Load the application icon from embedded resources (ID 1) at both
