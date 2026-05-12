@@ -435,6 +435,16 @@ unsafe extern "system" fn wnd_proc(
         return LRESULT(0);
     }
 
+    // Answer shutdown / logoff queries immediately and unconditionally so
+    // Windows never flags us as "preventing shutdown". Returning TRUE
+    // here is the documented way to say "I'm ready to exit"; the OS will
+    // follow up with WM_ENDSESSION. Doing this BEFORE DwmDefWindowProc
+    // and the main match avoids any chance of a slower path delaying
+    // the response past the shutdown manager's timeout.
+    if msg == WM_QUERYENDSESSION {
+        return LRESULT(1);
+    }
+
     // Let DWM handle caption-button interactions for everything except the
     // messages we own (frame layout, client-area mouse handling, and the
     // close path — we want to intercept WM_CLOSE / SC_CLOSE before DWM or
@@ -481,13 +491,33 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_ENDSESSION => {
             // Windows is logging off / shutting down (wparam != 0 means
-            // the session really is ending). Run our normal teardown so
-            // the tray icon is removed and any cleanup happens while we
-            // still have time — the OS would otherwise destroy us
-            // without giving WM_DESTROY a chance to fire on a hidden
-            // window via the close path.
+            // the session really is ending; 0 means the prior
+            // WM_QUERYENDSESSION was canceled). Per MSDN, the application
+            // "can return prior to processing this message" and the
+            // system "performs no further action if an application
+            // returns immediately" — so do the absolute minimum here.
+            //
+            // We deliberately do NOT call DestroyWindow: it cascades into
+            // WM_DESTROY → tray::shutdown → Shell_NotifyIconW round-trip
+            // to a shutting-down explorer.exe, which is exactly what
+            // gets us flagged as "preventing shutdown".
+            //
+            // We also do NOT call NIM_DELETE here. Windows reaps the
+            // tray icon automatically when the process terminates, and
+            // any Shell_NotifyIconW IPC to a shutting-down explorer.exe
+            // is what we are trying to avoid.
+            //
+            // We DO call PostQuitMessage so the message loop in
+            // `create_and_run` breaks promptly and the process exits
+            // through `main` rather than relying on the OS to terminate
+            // us after a timeout. MSDN says PostQuitMessage is not
+            // required, but it makes our exit deterministic and is
+            // cheap (sets a flag in the thread message queue, no IPC).
+            // The tray helper window's WM_ENDSESSION is a no-op for
+            // this reason — one PostQuitMessage on the shared loop is
+            // enough.
             if wparam.0 != 0 {
-                let _ = DestroyWindow(hwnd);
+                PostQuitMessage(0);
             }
             LRESULT(0)
         }
