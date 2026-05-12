@@ -19,6 +19,15 @@
 //! The "Settings" menu item is handled entirely on the tray side — the
 //! dialog parents off the invisible tray window so the main window can
 //! stay hidden.
+//!
+//! Session end (logoff / shutdown) takes a different path: both this
+//! tray helper window and the main window receive `WM_QUERYENDSESSION`
+//! and `WM_ENDSESSION` directly from the OS. Both handlers return
+//! immediately without calling `Shell_NotifyIconW` or `DestroyWindow`,
+//! because any IPC to a shutting-down `explorer.exe` is what triggers
+//! the "this app is preventing shutdown" UI. The OS reaps the tray icon
+//! automatically when the process terminates, so the normal
+//! `tray::shutdown` cascade is intentionally skipped on this path.
 
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -137,8 +146,8 @@ pub fn shutdown(tray_hwnd: HWND) {
     }
     // SAFETY: NIM_DELETE + DestroyWindow on a window we own.
     unsafe {
-        let mut nid = base_nid(tray_hwnd);
-        let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid);
+        let nid = base_nid(tray_hwnd);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
         let _ = DestroyWindow(tray_hwnd);
     }
 }
@@ -173,12 +182,12 @@ unsafe fn add_icon(hwnd: HWND, hicon: HICON) -> windows::core::Result<()> {
     nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
     nid.szTip[copy_len] = 0;
 
-    if !Shell_NotifyIconW(NIM_ADD, &mut nid).as_bool() {
+    if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
         return Err(Error::from_win32());
     }
     // NIM_SETVERSION upgrades the callback format; failure is non-fatal
     // (we still get callbacks, just in the legacy format).
-    let _ = Shell_NotifyIconW(NIM_SETVERSION, &mut nid);
+    let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
     Ok(())
 }
 
@@ -216,20 +225,23 @@ unsafe extern "system" fn tray_wnd_proc(
         // ready; WM_ENDSESSION will follow.
         WM_QUERYENDSESSION => LRESULT(1),
         WM_ENDSESSION => {
-            // Session is really ending (wparam != 0). Per MSDN we can
-            // return immediately; the OS will terminate the process.
-            // The main window's WM_ENDSESSION handler intentionally
-            // does nothing and defers icon cleanup to us — this tray
-            // helper window owns the icon, and centralising the
-            // NIM_DELETE here avoids a duplicate round-trip to a
-            // shutting-down explorer.exe on the shutdown critical path.
-            // Avoid calling DestroyWindow here for the same reason
-            // (cascading message processing is what triggers the
-            // "preventing shutdown" UI).
-            if wparam.0 != 0 {
-                let nid = base_nid(hwnd);
-                let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-            }
+            // Per MSDN, return as fast as possible — the application
+            // "can return prior to processing this message" and the
+            // system "performs no further action if an application
+            // returns immediately". We deliberately do NO work here:
+            //
+            // - No NIM_DELETE: explorer.exe is itself shutting down on
+            //   this code path, and any Shell_NotifyIconW round-trip is
+            //   exactly the IPC that gets us flagged as "preventing
+            //   shutdown". When the process terminates, Windows reaps
+            //   the tray icon automatically, so an explicit delete is
+            //   unnecessary.
+            // - No DestroyWindow: cascading WM_DESTROY processing has
+            //   the same blocking-IPC problem (it calls NIM_DELETE via
+            //   tray::shutdown) and would also prolong the handler.
+            //
+            // The main window's WM_ENDSESSION handler is likewise a
+            // no-op for the same reasons.
             LRESULT(0)
         }
         WM_APP_TRAY => {
@@ -269,8 +281,8 @@ unsafe extern "system" fn tray_wnd_proc(
             // Drop our boxed state. The icon should already have been
             // removed via `shutdown`, but call NIM_DELETE again just in
             // case (idempotent on a missing icon: returns FALSE, no harm).
-            let mut nid = base_nid(hwnd);
-            let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid);
+            let nid = base_nid(hwnd);
+            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
 
             let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
             if !p.is_null() {

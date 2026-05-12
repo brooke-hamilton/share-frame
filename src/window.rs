@@ -501,11 +501,12 @@ unsafe extern "system" fn wnd_proc(
             // trip to a shutting-down explorer.exe, which is exactly
             // what gets us flagged as "preventing shutdown".
             //
-            // The tray icon is removed by the tray helper window's own
-            // WM_ENDSESSION handler — it owns the icon and is also a
-            // top-level window, so it receives WM_ENDSESSION too. We
-            // intentionally do nothing here to avoid a second
-            // NIM_DELETE round-trip on the shutdown critical path.
+            // We also do NOT call NIM_DELETE here. Windows reaps the
+            // tray icon automatically when the process terminates, and
+            // any Shell_NotifyIconW IPC to a shutting-down explorer.exe
+            // is what we are trying to avoid. The tray helper window's
+            // WM_ENDSESSION handler is likewise a no-op for the same
+            // reason.
             LRESULT(0)
         }
         WM_DESTROY => on_destroy(hwnd),
