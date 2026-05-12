@@ -495,18 +495,30 @@ unsafe extern "system" fn wnd_proc(
             // WM_QUERYENDSESSION was canceled). Per MSDN, the application
             // "can return prior to processing this message" and the
             // system "performs no further action if an application
-            // returns immediately" — so return immediately. Calling
-            // DestroyWindow here would cascade into WM_DESTROY →
-            // tray::shutdown → DestroyWindow + Shell_NotifyIconW round-
-            // trip to a shutting-down explorer.exe, which is exactly
-            // what gets us flagged as "preventing shutdown".
+            // returns immediately" — so do the absolute minimum here.
+            //
+            // We deliberately do NOT call DestroyWindow: it cascades into
+            // WM_DESTROY → tray::shutdown → Shell_NotifyIconW round-trip
+            // to a shutting-down explorer.exe, which is exactly what
+            // gets us flagged as "preventing shutdown".
             //
             // We also do NOT call NIM_DELETE here. Windows reaps the
             // tray icon automatically when the process terminates, and
             // any Shell_NotifyIconW IPC to a shutting-down explorer.exe
-            // is what we are trying to avoid. The tray helper window's
-            // WM_ENDSESSION handler is likewise a no-op for the same
-            // reason.
+            // is what we are trying to avoid.
+            //
+            // We DO call PostQuitMessage so the message loop in
+            // `create_and_run` breaks promptly and the process exits
+            // through `main` rather than relying on the OS to terminate
+            // us after a timeout. MSDN says PostQuitMessage is not
+            // required, but it makes our exit deterministic and is
+            // cheap (sets a flag in the thread message queue, no IPC).
+            // The tray helper window's WM_ENDSESSION is a no-op for
+            // this reason — one PostQuitMessage on the shared loop is
+            // enough.
+            if wparam.0 != 0 {
+                PostQuitMessage(0);
+            }
             LRESULT(0)
         }
         WM_DESTROY => on_destroy(hwnd),

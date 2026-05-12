@@ -27,7 +27,10 @@
 //! because any IPC to a shutting-down `explorer.exe` is what triggers
 //! the "this app is preventing shutdown" UI. The OS reaps the tray icon
 //! automatically when the process terminates, so the normal
-//! `tray::shutdown` cascade is intentionally skipped on this path.
+//! `tray::shutdown` cascade is intentionally skipped on this path. The
+//! main window's `WM_ENDSESSION` handler calls `PostQuitMessage(0)` so
+//! the shared message loop in `create_and_run` exits promptly; the
+//! tray's handler is a pure no-op to avoid a redundant second post.
 
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -239,9 +242,9 @@ unsafe extern "system" fn tray_wnd_proc(
             // - No DestroyWindow: cascading WM_DESTROY processing has
             //   the same blocking-IPC problem (it calls NIM_DELETE via
             //   tray::shutdown) and would also prolong the handler.
-            //
-            // The main window's WM_ENDSESSION handler is likewise a
-            // no-op for the same reasons.
+            // - No PostQuitMessage: the main window's WM_ENDSESSION
+            //   handler posts WM_QUIT for the (single) shared message
+            //   loop, so duplicating it here would be redundant.
             LRESULT(0)
         }
         WM_APP_TRAY => {
