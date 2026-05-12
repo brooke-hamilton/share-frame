@@ -210,6 +210,25 @@ unsafe extern "system" fn tray_wnd_proc(
     }
 
     match msg {
+        // Answer shutdown queries immediately so Windows doesn't flag
+        // this top-level window (the invisible tray helper) as
+        // "preventing shutdown". Returning TRUE tells the OS we're
+        // ready; WM_ENDSESSION will follow.
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            // Session is really ending (wparam != 0). Per MSDN we can
+            // return immediately; the OS will terminate the process.
+            // Pull the icon out of the notification area inline so it
+            // doesn't ghost there until the next mouse hover. Avoid
+            // calling DestroyWindow here — the cascading message
+            // processing is what makes Windows show the "preventing
+            // shutdown" UI.
+            if wparam.0 != 0 {
+                let nid = base_nid(hwnd);
+                let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+            }
+            LRESULT(0)
+        }
         WM_APP_TRAY => {
             let event = tray_event(lparam);
             match event {
