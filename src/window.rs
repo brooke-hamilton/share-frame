@@ -10,7 +10,6 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
-use windows::Win32::UI::Shell::{NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Cached registered window message id. `RegisterWindowMessageW` returns the
@@ -496,30 +495,17 @@ unsafe extern "system" fn wnd_proc(
             // WM_QUERYENDSESSION was canceled). Per MSDN, the application
             // "can return prior to processing this message" and the
             // system "performs no further action if an application
-            // returns immediately" — so do the bare minimum cleanup
-            // INLINE and return fast. Calling DestroyWindow here would
-            // cascade into WM_DESTROY → tray::shutdown → another
-            // DestroyWindow + Shell_NotifyIconW(NIM_DELETE) round-trip
-            // to a shutting-down explorer.exe, which is exactly what
-            // gets us flagged as "preventing shutdown".
+            // returns immediately" — so return immediately. Calling
+            // DestroyWindow here would cascade into WM_DESTROY →
+            // tray::shutdown → DestroyWindow + Shell_NotifyIconW round-
+            // trip to a shutting-down explorer.exe, which is exactly
+            // what gets us flagged as "preventing shutdown".
             //
-            // We still want the tray icon removed so it doesn't linger
-            // as a ghost in the notification area until the next mouse
-            // hover; do that directly via NIM_DELETE (cheap, async-safe)
-            // and let process termination handle the rest.
-            if wparam.0 != 0 {
-                if let Some(tray_hwnd) = with_state(hwnd, |s| s.tray_hwnd) {
-                    if tray_hwnd != HWND::default() {
-                        let nid = NOTIFYICONDATAW {
-                            cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32,
-                            hWnd: tray_hwnd,
-                            uID: 1,
-                            ..Default::default()
-                        };
-                        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-                    }
-                }
-            }
+            // The tray icon is removed by the tray helper window's own
+            // WM_ENDSESSION handler — it owns the icon and is also a
+            // top-level window, so it receives WM_ENDSESSION too. We
+            // intentionally do nothing here to avoid a second
+            // NIM_DELETE round-trip on the shutdown critical path.
             LRESULT(0)
         }
         WM_DESTROY => on_destroy(hwnd),

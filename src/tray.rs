@@ -218,11 +218,14 @@ unsafe extern "system" fn tray_wnd_proc(
         WM_ENDSESSION => {
             // Session is really ending (wparam != 0). Per MSDN we can
             // return immediately; the OS will terminate the process.
-            // Pull the icon out of the notification area inline so it
-            // doesn't ghost there until the next mouse hover. Avoid
-            // calling DestroyWindow here — the cascading message
-            // processing is what makes Windows show the "preventing
-            // shutdown" UI.
+            // The main window's WM_ENDSESSION handler intentionally
+            // does nothing and defers icon cleanup to us — this tray
+            // helper window owns the icon, and centralising the
+            // NIM_DELETE here avoids a duplicate round-trip to a
+            // shutting-down explorer.exe on the shutdown critical path.
+            // Avoid calling DestroyWindow here for the same reason
+            // (cascading message processing is what triggers the
+            // "preventing shutdown" UI).
             if wparam.0 != 0 {
                 let nid = base_nid(hwnd);
                 let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
