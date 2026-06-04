@@ -25,8 +25,6 @@ jobs:
             arch: x64
           - target: aarch64-pc-windows-msvc
             arch: arm64
-          - target: i686-pc-windows-msvc
-            arch: x86
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

@@ -26,4 +26,4 @@ Releases are built and published automatically by the [`Release` workflow](../.g
    git tag -v v0.1.0
    ```
 
-That's it. The workflow builds x64, arm64, and x86 binaries, packages each as a zip with a SHA-256 checksum, and publishes a GitHub Release with auto-generated notes.
+That's it. The workflow builds x64 and arm64 binaries, packages each as a zip with a SHA-256 checksum, and publishes a GitHub Release with auto-generated notes.
