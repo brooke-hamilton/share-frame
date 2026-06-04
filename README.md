@@ -19,7 +19,21 @@ Ultrawide (21:9+) monitors are great for productivity — but terrible for scree
 
 ## Installation
 
-Build from source (requires [Rust](https://rustup.rs/)):
+### Download a release
+
+Grab the latest prebuilt binary from the [Releases](https://github.com/brooke-hamilton/share-frame/releases) page. Builds are provided for all Windows architectures:
+
+| Architecture | Asset |
+|---|---|
+| x64 (most PCs) | `share-frame-<version>-x64.zip` |
+| ARM64 (Surface / Snapdragon) | `share-frame-<version>-arm64.zip` |
+| x86 (32-bit) | `share-frame-<version>-x86.zip` |
+
+Each archive contains `share-frame.exe` and the license — copy the executable anywhere and run. No installer or runtime dependencies needed. A matching `.sha256` file is published for each archive so you can verify the download.
+
+### Build from source
+
+Requires [Rust](https://rustup.rs/):
 
 ```sh
 git clone https://github.com/brooke-hamilton/share-frame.git

@@ -186,7 +186,7 @@ Helper functions `logical_to_physical` and `physical_to_logical` are `#[cfg(test
 
 | Stage | Tool | Description |
 | ------- | ------ | ------------- |
-| Icon embedding | `build.rs` + `embed-resource` crate | Compiles [resources.rc](../resources.rc) to embed [share-frame.ico](../assets/icons/share-frame.ico) as resource ID 1 |
+| Icon & version embedding | `build.rs` + `winresource` crate | Embeds [share-frame.ico](../assets/icons/share-frame.ico) plus VERSIONINFO and the SxS manifest, with all version metadata derived from `Cargo.toml` |
 | Compilation | `cargo build --release` | Rust stable MSVC toolchain, Windows target |
 | Release optimizations | `Cargo.toml` `[profile.release]` | `strip = true`, `lto = true` for minimal binary size |
 | Icon generation | [scripts/generate-icon.ps1](../scripts/generate-icon.ps1) | Converts `logo.svg` → multi-resolution `.ico` via `resvg` |
@@ -253,10 +253,10 @@ The `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` attribu
 
 ```text
 share-frame/
-├── Cargo.toml                  # Crate config: windows 0.58, embed-resource 3, LTO release
+├── Cargo.toml                  # Crate config: windows 0.58, winresource 0.1, LTO release
 ├── Cargo.lock                  # Locked dependency versions
-├── build.rs                    # Embeds resources.rc (icon) into the binary
-├── resources.rc                # Win32 resource script — icon ID 1
+├── build.rs                    # Embeds icon + version resource via winresource (version from Cargo.toml)
+├── share-frame.manifest        # SxS manifest template (version injected by build.rs)
 ├── README.md                   # User-facing documentation
 ├── LICENSE                     # Project license
 ├── assets/
