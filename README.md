@@ -19,7 +19,36 @@ Ultrawide (21:9+) monitors are great for productivity — but terrible for scree
 
 ## Installation
 
-### Download a release
+### Install with the script (recommended)
+
+The installer downloads the latest release for your architecture, verifies its SHA-256 checksum, extracts `share-frame.exe`, and creates a Start Menu shortcut. Run it in PowerShell:
+
+```pwsh
+irm https://raw.githubusercontent.com/brooke-hamilton/share-frame/main/scripts/install.ps1 | iex
+```
+
+Or clone the repo and run it locally with options:
+
+```pwsh
+# Install the latest release and add share-frame to your user PATH
+./scripts/install.ps1 -AddToPath
+
+# Install a specific version
+./scripts/install.ps1 -Version v0.1.0
+```
+
+By default Share Frame is installed to `%LOCALAPPDATA%\Programs\share-frame`. Useful options:
+
+| Option | Effect |
+|---|---|
+| `-Version <tag>` | Install a specific release (for example `v0.1.0`) instead of the latest |
+| `-InstallDir <path>` | Install to a custom directory |
+| `-AddToPath` | Add the install directory to your user `PATH` |
+| `-NoShortcut` | Skip creating the Start Menu shortcut |
+
+To uninstall, delete the install directory and the `Share Frame` Start Menu shortcut.
+
+### Download a release manually
 
 Grab the latest prebuilt binary from the [Releases](https://github.com/brooke-hamilton/share-frame/releases) page. Builds are provided for 64-bit Windows architectures:
 

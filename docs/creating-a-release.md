@@ -56,4 +56,3 @@ The workflow builds whatever commit the tag points to, so after committing your 
    ```
 
 > If a GitHub Release *was* already published for the version, do **not** reuse the tag. Bump the version in [`Cargo.toml`](../Cargo.toml) instead and follow the normal release steps above with the new version number.
-
