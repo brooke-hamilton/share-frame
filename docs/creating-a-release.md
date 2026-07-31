@@ -26,7 +26,7 @@ Releases are built and published automatically by the [`Release` workflow](../.g
    git tag -v v0.1.0
    ```
 
-That's it. The workflow builds x64 and arm64 binaries, packages each as a zip with a SHA-256 checksum, and publishes a GitHub Release with auto-generated notes.
+That's it. The workflow builds x64 and arm64 binaries with the MSVC C runtime statically linked, packages each as a zip with a SHA-256 checksum, and publishes a GitHub Release with auto-generated notes. The resulting archives run on bare Windows installations without requiring the Visual C++ Redistributable.
 
 ## Recovering from a failed release workflow
 

@@ -56,7 +56,7 @@ Grab the latest prebuilt binary from the [Releases](https://github.com/brooke-ha
 | x64 (most PCs) | `share-frame-<version>-x64.zip` |
 | ARM64 (Surface / Snapdragon) | `share-frame-<version>-arm64.zip` |
 
-Each archive contains `share-frame.exe` and the license — copy the executable anywhere and run. No installer or runtime dependencies needed. A matching `.sha256` file is published for each archive so you can verify the download.
+Each archive contains `share-frame.exe` and the license — copy the executable anywhere and run. The Windows C runtime is statically linked, so no separate Visual C++ Redistributable installation is required. A matching `.sha256` file is published for each archive so you can verify the download.
 
 ### Build from source
 
@@ -68,7 +68,7 @@ cd share-frame
 cargo build --release
 ```
 
-Output: `target/release/share-frame.exe` — copy it anywhere and run. No installer or runtime dependencies needed.
+Output: `target/release/share-frame.exe` — copy it anywhere and run. The Windows C runtime is statically linked, so no separate runtime dependencies are needed.
 
 ## How It Works
 
