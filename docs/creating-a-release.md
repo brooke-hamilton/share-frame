@@ -4,10 +4,14 @@ Releases are built and published automatically by the [`Release` workflow](../.g
 
 ## Steps
 
-1. **Bump the version** in [`Cargo.toml`](../Cargo.toml) (the `version` field) and commit it to `main`.
+1. **Bump the version** in [`Cargo.toml`](../Cargo.toml) (the `version` field), run a build so
+   [`Cargo.lock`](../Cargo.lock) picks up the new version, and commit both to `main`.
+
+   Stage the two files explicitly (rather than `git commit -a`) so the release commit can't
+   accidentally sweep in unrelated local changes.
 
    ```pwsh
-   git commit -am "Release v0.1.0"
+   git commit -s -m "Release v0.1.0" Cargo.toml Cargo.lock
    git push origin main
    ```
 
