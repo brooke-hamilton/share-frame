@@ -59,6 +59,9 @@ struct WindowState {
     capture: CaptureState,
     render_cache: RenderCache,
     send_back_hovered: bool,
+    /// Which caption button (if any) the pointer is currently over, so the
+    /// hover highlight and glyph repaint correctly.
+    caption_hovered: Option<geometry::CaptionButton>,
     tracking_mouse: bool,
     title_bar_height: i32,
     is_active: bool,
@@ -582,7 +585,7 @@ unsafe extern "system" fn wnd_proc(
             // standard non-client frame so we can draw our own title bar.
             LRESULT(0)
         }
-        WM_NCHITTEST => on_nc_hit_test(hwnd, msg, wparam, lparam),
+        WM_NCHITTEST => on_nc_hit_test(hwnd, lparam),
         WM_DPICHANGED => on_dpi_changed(hwnd, lparam),
         WM_SETTINGCHANGE => {
             apply_dark_mode(hwnd);
@@ -635,6 +638,7 @@ unsafe fn on_create(hwnd: HWND) -> LRESULT {
         capture: cap_state,
         render_cache: RenderCache::default(),
         send_back_hovered: false,
+        caption_hovered: None,
         tracking_mouse: false,
         title_bar_height,
         // Newly created top-level windows are activated by the OS.
@@ -673,13 +677,19 @@ unsafe fn on_timer(hwnd: HWND) -> LRESULT {
 
 unsafe fn on_paint(hwnd: HWND) -> LRESULT {
     let dpi = GetDpiForWindow(hwnd);
+    let is_maximized = IsZoomed(hwnd).as_bool();
     let painted = with_state(hwnd, |state| {
         let theme = current_title_bar_theme(state.is_active);
+        let buttons = render::TitleBarButtons {
+            send_back_hovered: state.send_back_hovered,
+            caption_hovered: state.caption_hovered,
+            is_maximized,
+        };
         render::paint(
             hwnd,
             &state.capture,
             &mut state.render_cache,
-            state.send_back_hovered,
+            buttons,
             state.title_bar_height,
             dpi,
             theme,
@@ -705,11 +715,15 @@ unsafe fn on_size(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 state.capture.capture_frame();
             }
         }
+        // Repaint the title bar so the maximize/restore glyph and the
+        // right-aligned caption buttons track the new width.
+        let strip = RECT { left: 0, top: 0, right: width, bottom: state.title_bar_height };
+        let _ = InvalidateRect(hwnd, Some(&strip), FALSE);
     });
     LRESULT(0)
 }
 
-unsafe fn on_nc_hit_test(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe fn on_nc_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let (x, y) = lparam_to_xy(lparam);
 
     let mut rect = RECT::default();
@@ -720,7 +734,7 @@ unsafe fn on_nc_hit_test(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
     let tb_height = with_state(hwnd, |s| s.title_bar_height)
         .unwrap_or_else(|| compute_title_bar_height(hwnd));
 
-    // The DWM caption buttons live in the top-right strip (within the title
+    // The caption buttons live in the top-right strip (within the title
     // bar height). Suppress border resize hits there so the close/maximize
     // buttons remain clickable; everywhere else the right edge resizes.
     let in_caption_buttons_strip =
@@ -752,19 +766,23 @@ unsafe fn on_nc_hit_test(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
     }
 
     if y < rect.top + tb_height {
-        // "Send to Back" button — left of the DWM caption buttons.
+        // "Send to Back" button — left of the caption buttons.
         let client_width = rect.right - rect.left;
         let client_x = x - rect.left;
+        let client_y = y - rect.top;
         let (button_left, button_right) =
             geometry::send_back_button_range(client_width, caption_buttons_width);
         if client_x >= button_left && client_x < button_right {
             return LRESULT(HTCLIENT as isize);
         }
 
-        // Let DWM check if cursor is over a caption button (close/max).
-        let mut dwm_result = LRESULT(0);
-        if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool() {
-            return dwm_result;
+        // Self-drawn minimize / maximize / close buttons are handled in the
+        // client area (WM_MOUSEMOVE / WM_LBUTTONUP), so report HTCLIENT.
+        let dpi = GetDpiForWindow(hwnd);
+        if geometry::caption_button_at(client_x, client_y, client_width, tb_height, dpi)
+            .is_some()
+        {
+            return LRESULT(HTCLIENT as isize);
         }
 
         return LRESULT(HTCAPTION as isize);
@@ -806,6 +824,7 @@ unsafe fn on_mouse_move(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let _ = GetClientRect(hwnd, &mut client_rect);
     let cw = client_rect.right - client_rect.left;
     let cap_w = caption_buttons_width(hwnd);
+    let dpi = GetDpiForWindow(hwnd);
 
     with_state(hwnd, |state| {
         if !state.tracking_mouse {
@@ -831,6 +850,18 @@ unsafe fn on_mouse_move(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             };
             let _ = InvalidateRect(hwnd, Some(&btn_rect), FALSE);
         }
+
+        let caption = geometry::caption_button_at(x, y, cw, state.title_bar_height, dpi);
+        if caption != state.caption_hovered {
+            state.caption_hovered = caption;
+            let strip = RECT {
+                left: cw - cap_w,
+                top: 0,
+                right: cw,
+                bottom: state.title_bar_height,
+            };
+            let _ = InvalidateRect(hwnd, Some(&strip), FALSE);
+        }
     });
     LRESULT(0)
 }
@@ -838,8 +869,9 @@ unsafe fn on_mouse_move(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 unsafe fn on_mouse_leave(hwnd: HWND) -> LRESULT {
     with_state(hwnd, |state| {
         state.tracking_mouse = false;
-        if state.send_back_hovered {
+        if state.send_back_hovered || state.caption_hovered.is_some() {
             state.send_back_hovered = false;
+            state.caption_hovered = None;
             let _ = InvalidateRect(hwnd, None, FALSE);
         }
     });
@@ -855,6 +887,27 @@ unsafe fn on_lbutton_up(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let _ = GetClientRect(hwnd, &mut client_rect);
     let cw = client_rect.right - client_rect.left;
     let cap_w = caption_buttons_width(hwnd);
+    let dpi = GetDpiForWindow(hwnd);
+
+    if let Some(button) = geometry::caption_button_at(x, y, cw, tb_height, dpi) {
+        match button {
+            geometry::CaptionButton::Minimize => {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            }
+            geometry::CaptionButton::Maximize => {
+                if IsZoomed(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                }
+            }
+            geometry::CaptionButton::Close => {
+                // Match the × behavior: hide to tray instead of destroying.
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+        return LRESULT(0);
+    }
 
     if geometry::point_in_send_back_button(x, y, cw, tb_height, cap_w) {
         let _ = SetWindowPos(
@@ -898,8 +951,8 @@ unsafe fn find_topmost_app_window(exclude: HWND) -> Option<HWND> {
     }
 }
 
-/// Returns the width of DWM-drawn caption buttons (close + maximize +
-/// minimize), falling back to a constant if the API fails.
+/// Returns the total width of the self-drawn caption buttons (minimize +
+/// maximize + close) at the window's current DPI.
 unsafe fn caption_buttons_width(hwnd: HWND) -> i32 {
     geometry::caption_buttons_width(hwnd)
 }

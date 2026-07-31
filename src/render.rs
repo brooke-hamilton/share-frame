@@ -18,6 +18,18 @@ const GRID_LINE_COLOR: COLORREF = COLORREF(0x00FFFFFF);
 const ERROR_FILL_COLOR: COLORREF = COLORREF(0x0000008B);
 /// Glyph code point for the "Send to Back" button (Segoe MDL2 Assets).
 const SEND_BACK_GLYPH: u16 = 0xE72D;
+/// Segoe MDL2 Assets glyphs for the self-drawn caption buttons.
+const GLYPH_MINIMIZE: u16 = 0xE921;
+const GLYPH_MAXIMIZE: u16 = 0xE922;
+const GLYPH_RESTORE: u16 = 0xE923;
+const GLYPH_CLOSE: u16 = 0xE8BB;
+/// Logical height (at 96 DPI) of the caption-button glyphs. Matches the
+/// Windows 11 caption glyph size, which is smaller than the title text.
+const CAPTION_GLYPH_HEIGHT: i32 = 10;
+/// Windows-standard close-button hover fill (RGB 232,17,35) as 0x00BBGGRR.
+const CLOSE_HOVER_COLOR: COLORREF = COLORREF(0x002311E8);
+/// Glyph color used on the close button while it shows its red hover fill.
+const CLOSE_HOVER_GLYPH_COLOR: COLORREF = COLORREF(0x00FFFFFF);
 /// Window title rendered in the custom title bar. Must be ASCII so the
 /// byte length equals the UTF-16 code-unit length used by the on-stack
 /// buffer in [`title_text_buffer`].
@@ -26,6 +38,15 @@ const WINDOW_TITLE_LEN: usize = WINDOW_TITLE.len();
 const _: () = assert!(WINDOW_TITLE.is_ascii(), "WINDOW_TITLE must be ASCII");
 /// Source-over blend op for `BLENDFUNCTION::BlendOp`.
 const AC_SRC_OVER: u8 = 0x00;
+
+/// Interactive state of the title bar's buttons, passed to [`paint`] each
+/// frame so hover highlights and the maximize/restore glyph stay in sync.
+#[derive(Copy, Clone, Default)]
+pub struct TitleBarButtons {
+    pub send_back_hovered: bool,
+    pub caption_hovered: Option<geometry::CaptionButton>,
+    pub is_maximized: bool,
+}
 
 /// Colors used to paint the custom title bar. Computed from the active
 /// Windows theme and DWM accent settings each paint so it matches whatever
@@ -42,6 +63,10 @@ struct CachedFonts {
     dpi: u32,
     title_font: HFONT,
     icon_font: HFONT,
+    /// Smaller glyph font for the caption buttons, matching the Windows 11
+    /// caption-button size. Prefers "Segoe Fluent Icons" (Windows 11) and
+    /// falls back to "Segoe MDL2 Assets" (Windows 10).
+    caption_font: HFONT,
 }
 
 impl CachedFonts {
@@ -49,10 +74,17 @@ impl CachedFonts {
         // SAFETY: Plain GDI font creation; handles are owned by `Self`.
         unsafe {
             let height = -scale_font_for_dpi(dpi);
+            let caption_height = -((CAPTION_GLYPH_HEIGHT as i64 * dpi as i64) / 96) as i32;
+            let caption_face = if font_installed(w!("Segoe Fluent Icons")) {
+                w!("Segoe Fluent Icons")
+            } else {
+                w!("Segoe MDL2 Assets")
+            };
             Self {
                 dpi,
                 title_font: create_font(height, w!("Segoe UI")),
                 icon_font: create_font(height, w!("Segoe MDL2 Assets")),
+                caption_font: create_font(caption_height, caption_face),
             }
         }
     }
@@ -60,11 +92,12 @@ impl CachedFonts {
 
 impl Drop for CachedFonts {
     fn drop(&mut self) {
-        // SAFETY: Both handles were created in `create` and are not
-        // currently selected into any DC at drop time.
+        // SAFETY: Handles were created in `create` and are not currently
+        // selected into any DC at drop time.
         unsafe {
             let _ = DeleteObject(self.title_font);
             let _ = DeleteObject(self.icon_font);
+            let _ = DeleteObject(self.caption_font);
         }
     }
 }
@@ -171,7 +204,7 @@ pub fn paint(
     hwnd: HWND,
     state: &CaptureState,
     cache: &mut RenderCache,
-    send_back_hovered: bool,
+    buttons: TitleBarButtons,
     title_bar_height: i32,
     dpi: u32,
     theme: TitleBarTheme,
@@ -224,13 +257,13 @@ pub fn paint(
                 cw,
                 title_bar_height,
                 caption_buttons_width,
-                send_back_hovered,
+                buttons,
                 dpi,
                 hwnd,
                 theme,
             );
 
-            fix_title_bar_alpha(bits_ptr, cw, title_bar_height, caption_buttons_width);
+            fix_title_bar_alpha(bits_ptr, cw, title_bar_height);
         }
 
         if content_dirty {
@@ -270,7 +303,7 @@ unsafe fn paint_title_bar(
     cw: i32,
     tb_height: i32,
     caption_buttons_width: i32,
-    send_back_hovered: bool,
+    buttons: TitleBarButtons,
     dpi: u32,
     hwnd: HWND,
     theme: TitleBarTheme,
@@ -284,7 +317,7 @@ unsafe fn paint_title_bar(
     let (button_left, button_right) =
         geometry::send_back_button_range(cw, caption_buttons_width);
 
-    if send_back_hovered {
+    if buttons.send_back_hovered {
         fill_solid(
             hdc,
             RECT {
@@ -355,25 +388,89 @@ unsafe fn paint_title_bar(
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
     SelectObject(hdc, old_font);
+
+    paint_caption_buttons(hdc, cw, tb_height, buttons, dpi, theme, fonts.caption_font);
 }
 
-/// Sets the alpha channel to 255 across the title bar **except** the
-/// rightmost strip where DWM will draw native caption buttons; that strip
-/// must remain transparent (alpha=0) so DWM's glyphs show through.
+/// Draws the minimize, maximize/restore, and close buttons at the right of
+/// the title bar. Share Frame paints these itself so they render on every
+/// machine; relying on DWM to composite native caption buttons through the
+/// extended frame fails on some clean installs.
+unsafe fn paint_caption_buttons(
+    hdc: HDC,
+    cw: i32,
+    tb_height: i32,
+    buttons: TitleBarButtons,
+    dpi: u32,
+    theme: TitleBarTheme,
+    glyph_font: HFONT,
+) {
+    use geometry::CaptionButton;
+
+    let old_font = SelectObject(hdc, glyph_font);
+    SetBkMode(hdc, TRANSPARENT);
+
+    for button in [CaptionButton::Minimize, CaptionButton::Maximize, CaptionButton::Close] {
+        let (left, right) = geometry::caption_button_range(button, cw, dpi);
+        let rect = RECT { left, top: 0, right, bottom: tb_height };
+        let hovered = buttons.caption_hovered == Some(button);
+
+        if hovered {
+            let fill = if button == CaptionButton::Close {
+                CLOSE_HOVER_COLOR
+            } else {
+                theme.hover
+            };
+            fill_solid(hdc, rect, fill);
+        }
+
+        let glyph_color = if hovered && button == CaptionButton::Close {
+            CLOSE_HOVER_GLYPH_COLOR
+        } else {
+            theme.text
+        };
+        SetTextColor(hdc, glyph_color);
+
+        let code = match button {
+            CaptionButton::Minimize => GLYPH_MINIMIZE,
+            CaptionButton::Maximize => {
+                if buttons.is_maximized {
+                    GLYPH_RESTORE
+                } else {
+                    GLYPH_MAXIMIZE
+                }
+            }
+            CaptionButton::Close => GLYPH_CLOSE,
+        };
+        let mut glyph = [code];
+        let mut glyph_rect = rect;
+        DrawTextW(
+            hdc,
+            &mut glyph,
+            &mut glyph_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+    }
+
+    SelectObject(hdc, old_font);
+}
+
+/// Sets the alpha channel to 255 across the entire title bar. GDI drawing
+/// leaves the alpha byte at 0, which DWM would treat as transparent glass in
+/// the extended frame; forcing it opaque makes our self-painted title bar
+/// (including the caption buttons) fully visible.
 unsafe fn fix_title_bar_alpha(
     bits_ptr: *mut std::ffi::c_void,
     cw: i32,
     tb_height: i32,
-    caption_buttons_width: i32,
 ) {
     if bits_ptr.is_null() || cw <= 0 || tb_height <= 0 {
         return;
     }
     let stride = cw as usize * 4; // 32 bpp
     let pixels = bits_ptr as *mut u8;
-    let opaque_right = (cw - caption_buttons_width).max(0) as usize;
     for row in 0..tb_height as usize {
-        for col in 0..opaque_right {
+        for col in 0..cw as usize {
             let offset = row * stride + col * 4 + 3; // alpha byte
             *pixels.add(offset) = 255;
         }
@@ -492,6 +589,41 @@ unsafe fn create_font(height: i32, name: windows::core::PCWSTR) -> HFONT {
         DEFAULT_PITCH.0 as u32 | (FF_DONTCARE.0 as u32),
         name,
     )
+}
+
+/// Returns whether a font with the given face name is installed. Used to
+/// prefer "Segoe Fluent Icons" (Windows 11) over "Segoe MDL2 Assets" for the
+/// caption glyphs, matching the modern Windows 11 look where available.
+unsafe fn font_installed(face: windows::core::PCWSTR) -> bool {
+    unsafe extern "system" fn enum_proc(
+        _lf: *const LOGFONTW,
+        _tm: *const TEXTMETRICW,
+        _font_type: u32,
+        lparam: LPARAM,
+    ) -> i32 {
+        *(lparam.0 as *mut bool) = true;
+        0 // stop enumeration on first match
+    }
+
+    let mut logfont = LOGFONTW {
+        lfCharSet: DEFAULT_CHARSET,
+        ..Default::default()
+    };
+    for (dst, &src) in logfont.lfFaceName.iter_mut().zip(face.as_wide()) {
+        *dst = src;
+    }
+
+    let hdc = GetDC(None);
+    let mut found = false;
+    EnumFontFamiliesExW(
+        hdc,
+        &logfont,
+        Some(enum_proc),
+        LPARAM(&mut found as *mut bool as isize),
+        0,
+    );
+    ReleaseDC(None, hdc);
+    found
 }
 
 /// Converts the configured logical font height to physical pixels for the
