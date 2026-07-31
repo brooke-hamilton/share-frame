@@ -29,9 +29,20 @@ pub const MIN_HEIGHT: i32 = 150;
 pub const SEND_BACK_BUTTON_WIDTH: i32 = 46;
 /// Resize border width for hit testing.
 pub const RESIZE_MARGIN: i32 = 8;
-/// Fallback width for the three DWM caption buttons at 100% DPI when
-/// `DwmGetWindowAttribute(DWMWA_CAPTION_BUTTON_BOUNDS)` is unavailable.
-pub const DEFAULT_CAPTION_BUTTONS_WIDTH: i32 = 138;
+/// Logical width (at 96 DPI) of each self-drawn caption button
+/// (minimize / maximize / close). Share Frame paints these itself rather
+/// than relying on DWM to composite native caption buttons through the
+/// extended frame, which does not render on all machines.
+pub const CAPTION_BUTTON_WIDTH: i32 = 46;
+
+/// One of the three self-drawn caption buttons, ordered left-to-right as
+/// they appear from the right edge of the title bar.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CaptionButton {
+    Minimize,
+    Maximize,
+    Close,
+}
 /// Spacing in pixels between grid lines drawn over the captured frame.
 pub const GRID_SPACING: i32 = 48;
 /// Constant alpha used for the grid overlay (~10%).
@@ -95,7 +106,6 @@ pub fn centered_position(window_size: Size, work_area: Rect) -> Point {
 }
 
 /// Converts logical pixels to physical pixels for the given DPI (rounded).
-#[cfg(test)]
 pub fn logical_to_physical(logical: i32, dpi: u32) -> i32 {
     let dpi = dpi as i64;
     let logical = logical as i64;
@@ -117,24 +127,63 @@ pub fn physical_to_logical(physical: i32, dpi: u32) -> i32 {
 
 // --- Win32-Dependent Functions ---
 
-/// Returns the width of DWM-drawn caption buttons (close + maximize +
-/// minimize), falling back to a constant if the API is unavailable.
+/// Returns the total width of the three self-drawn caption buttons at the
+/// given window's DPI. Used to reserve the right-hand strip of the title
+/// bar and to position the "Send to Back" button left of it.
 pub unsafe fn caption_buttons_width(hwnd: windows::Win32::Foundation::HWND) -> i32 {
     use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Dwm::*;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-    let mut buttons_rect = RECT::default();
-    let result = DwmGetWindowAttribute(
-        hwnd,
-        DWMWA_CAPTION_BUTTON_BOUNDS,
-        &mut buttons_rect as *mut _ as *mut _,
-        std::mem::size_of::<RECT>() as u32,
-    );
-    if result.is_ok() {
-        buttons_rect.right - buttons_rect.left
-    } else {
-        DEFAULT_CAPTION_BUTTONS_WIDTH
+    let dpi = GetDpiForWindow(hwnd);
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    let mut rect = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rect);
+    let client_width = rect.right - rect.left;
+    3 * caption_button_width(client_width, dpi)
+}
+
+/// Physical width of a single caption button, clamped so all three always
+/// fit within `client_width`. Without the clamp, high-DPI + very narrow
+/// windows (down to `MIN_WIDTH` physical pixels) would yield negative
+/// `left` coordinates and make hit-testing treat the whole title bar as
+/// caption buttons, breaking window dragging.
+fn caption_button_width(client_width: i32, dpi: u32) -> i32 {
+    let ideal = logical_to_physical(CAPTION_BUTTON_WIDTH, dpi);
+    let max_fit = (client_width / 3).max(0);
+    ideal.min(max_fit)
+}
+
+/// Returns the inclusive-exclusive client-x range `(left, right)` of one
+/// caption button. From the right edge: Close, then Maximize, then Minimize.
+pub fn caption_button_range(button: CaptionButton, client_width: i32, dpi: u32) -> (i32, i32) {
+    let bw = caption_button_width(client_width, dpi);
+    match button {
+        CaptionButton::Close => (client_width - bw, client_width),
+        CaptionButton::Maximize => (client_width - 2 * bw, client_width - bw),
+        CaptionButton::Minimize => (client_width - 3 * bw, client_width - 2 * bw),
     }
+}
+
+/// Returns which caption button contains `(x, y)` (client coordinates), or
+/// `None` if the point is outside the title bar or the caption-button strip.
+pub fn caption_button_at(
+    x: i32,
+    y: i32,
+    client_width: i32,
+    title_bar_height: i32,
+    dpi: u32,
+) -> Option<CaptionButton> {
+    if y < 0 || y >= title_bar_height {
+        return None;
+    }
+    for button in [CaptionButton::Minimize, CaptionButton::Maximize, CaptionButton::Close] {
+        let (left, right) = caption_button_range(button, client_width, dpi);
+        if x >= left && x < right {
+            return Some(button);
+        }
+    }
+    None
 }
 
 /// Gets the work area for the monitor containing the given window.
@@ -304,5 +353,64 @@ mod tests {
         let cw = 800;
         let cap = 138;
         assert!(!point_in_send_back_button(cw - 10, 5, cw, 30, cap));
+    }
+
+    // --- caption button geometry ---
+
+    #[test]
+    fn caption_buttons_ordered_close_rightmost() {
+        let cw = 800;
+        let (min_l, min_r) = caption_button_range(CaptionButton::Minimize, cw, 96);
+        let (max_l, max_r) = caption_button_range(CaptionButton::Maximize, cw, 96);
+        let (close_l, close_r) = caption_button_range(CaptionButton::Close, cw, 96);
+        assert_eq!(close_r, cw);
+        assert_eq!(close_l, max_r);
+        assert_eq!(max_l, min_r);
+        assert_eq!(min_l, cw - 3 * CAPTION_BUTTON_WIDTH);
+    }
+
+    #[test]
+    fn caption_button_at_maps_each_button() {
+        let cw = 800;
+        let (close_l, _) = caption_button_range(CaptionButton::Close, cw, 96);
+        let (max_l, _) = caption_button_range(CaptionButton::Maximize, cw, 96);
+        let (min_l, _) = caption_button_range(CaptionButton::Minimize, cw, 96);
+        assert_eq!(caption_button_at(close_l + 1, 5, cw, 30, 96), Some(CaptionButton::Close));
+        assert_eq!(caption_button_at(max_l + 1, 5, cw, 30, 96), Some(CaptionButton::Maximize));
+        assert_eq!(caption_button_at(min_l + 1, 5, cw, 30, 96), Some(CaptionButton::Minimize));
+    }
+
+    #[test]
+    fn caption_button_at_outside_strip_is_none() {
+        let cw = 800;
+        assert_eq!(caption_button_at(10, 5, cw, 30, 96), None);
+        assert_eq!(caption_button_at(cw - 1, 30, cw, 30, 96), None);
+        assert_eq!(caption_button_at(cw - 1, -1, cw, 30, 96), None);
+    }
+
+    #[test]
+    fn caption_button_width_scales_with_dpi() {
+        let at96 = caption_button_range(CaptionButton::Close, 800, 96);
+        let at144 = caption_button_range(CaptionButton::Close, 800, 144);
+        assert_eq!(at96.1 - at96.0, CAPTION_BUTTON_WIDTH);
+        assert_eq!(at144.1 - at144.0, logical_to_physical(CAPTION_BUTTON_WIDTH, 144));
+    }
+
+    #[test]
+    fn caption_buttons_stay_in_bounds_when_narrow() {
+        // High DPI + a window at MIN_WIDTH: buttons would overflow without
+        // the clamp. All ranges must stay within [0, client_width] and not
+        // overlap.
+        let cw = MIN_WIDTH;
+        let dpi = 192; // 200%
+        let (min_l, min_r) = caption_button_range(CaptionButton::Minimize, cw, dpi);
+        let (max_l, max_r) = caption_button_range(CaptionButton::Maximize, cw, dpi);
+        let (close_l, close_r) = caption_button_range(CaptionButton::Close, cw, dpi);
+        assert!(min_l >= 0, "minimize left {min_l} should be non-negative");
+        assert_eq!(min_r, max_l);
+        assert_eq!(max_r, close_l);
+        assert_eq!(close_r, cw);
+        // caption_button_at must never match outside the client area.
+        assert_eq!(caption_button_at(-1, 5, cw, 30, dpi), None);
     }
 }
