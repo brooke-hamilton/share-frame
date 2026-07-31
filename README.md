@@ -1,6 +1,5 @@
 # <img src="assets/icons/logo.svg" width="32" alt="Share Frame logo"/> Share Frame
 
-**Share exactly what you mean.**
 A lightweight screen-region sharing tool for ultrawide monitor users on Microsoft Teams.
 
 [Installation](#installation) •
