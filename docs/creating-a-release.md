@@ -7,7 +7,7 @@ Releases are built and published automatically by the [`Release` workflow](../.g
 1. **Bump the version** in [`Cargo.toml`](../Cargo.toml) (the `version` field) and commit it to `main`.
 
    ```pwsh
-   git commit -am "Release v0.1.0"
+   git commit -s -am "Release v0.1.0"
    git push origin main
    ```
 
