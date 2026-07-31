@@ -1,6 +1,6 @@
 [package]
 name = "share-frame"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Windows desktop overlay that mirrors the screen region behind it for screen-sharing."
 license = "MIT"
