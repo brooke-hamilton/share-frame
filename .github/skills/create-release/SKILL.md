@@ -48,10 +48,12 @@ for editing the workflow or for unrelated tagging.
    - **Before pushing the tag,** show the user the exact version and commit SHA being tagged and get
      explicit confirmation — the tag push starts a public release.
 
-4. **Monitor the Release workflow** (the doc ends once the tag is pushed; this part is on the agent):
+4. **Monitor the Release workflow** (the doc ends once the tag is pushed; this part is on the agent).
+   Filter by the tag you just pushed so you watch the run for this release and not an unrelated one
+   (for a tag push, the run's head branch is the tag name):
 
    ```pwsh
-   gh run list --workflow release.yml --limit 1
+   gh run list --workflow release.yml --branch vX.Y.Z --limit 1
    gh run watch <run-id> --exit-status
    ```
 
