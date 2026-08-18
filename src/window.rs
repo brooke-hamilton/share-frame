@@ -680,16 +680,17 @@ unsafe fn on_paint(hwnd: HWND) -> LRESULT {
     let is_maximized = IsZoomed(hwnd).as_bool();
     let painted = with_state(hwnd, |state| {
         let theme = current_title_bar_theme(state.is_active);
-        let buttons = render::TitleBarButtons {
+        let visuals = render::WindowVisualState {
             send_back_hovered: state.send_back_hovered,
             caption_hovered: state.caption_hovered,
             is_maximized,
+            is_active: state.is_active,
         };
         render::paint(
             hwnd,
             &state.capture,
             &mut state.render_cache,
-            buttons,
+            visuals,
             state.title_bar_height,
             dpi,
             theme,
