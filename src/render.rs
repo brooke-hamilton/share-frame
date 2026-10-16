@@ -39,13 +39,14 @@ const _: () = assert!(WINDOW_TITLE.is_ascii(), "WINDOW_TITLE must be ASCII");
 /// Source-over blend op for `BLENDFUNCTION::BlendOp`.
 const AC_SRC_OVER: u8 = 0x00;
 
-/// Interactive state of the title bar's buttons, passed to [`paint`] each
-/// frame so hover highlights and the maximize/restore glyph stay in sync.
+/// Window state that affects rendering, passed to [`paint`] each frame so
+/// activity, hover highlights, and the maximize/restore glyph stay in sync.
 #[derive(Copy, Clone, Default)]
-pub struct TitleBarButtons {
+pub struct WindowVisualState {
     pub send_back_hovered: bool,
     pub caption_hovered: Option<geometry::CaptionButton>,
     pub is_maximized: bool,
+    pub is_active: bool,
 }
 
 /// Colors used to paint the custom title bar. Computed from the active
@@ -198,13 +199,14 @@ impl RenderCache {
 }
 
 /// Paints the title bar (with custom "Send to Back" button and title text),
-/// captured content, and grid overlay. Uses a 32-bit DIB section buffer so
-/// the alpha channel can be set for DWM glass compositing.
+/// captured content, and the grid overlay while the window is active. Uses a
+/// 32-bit DIB section buffer so the alpha channel can be set for DWM glass
+/// compositing.
 pub fn paint(
     hwnd: HWND,
     state: &CaptureState,
     cache: &mut RenderCache,
-    buttons: TitleBarButtons,
+    visuals: WindowVisualState,
     title_bar_height: i32,
     dpi: u32,
     theme: TitleBarTheme,
@@ -257,7 +259,7 @@ pub fn paint(
                 cw,
                 title_bar_height,
                 caption_buttons_width,
-                buttons,
+                visuals,
                 dpi,
                 hwnd,
                 theme,
@@ -268,7 +270,9 @@ pub fn paint(
 
         if content_dirty {
             paint_content(buf_dc, state, cw, content_height, title_bar_height);
-            paint_grid_overlay(buf_dc, cw, content_height, title_bar_height);
+            if should_paint_grid(visuals.is_active) {
+                paint_grid_overlay(buf_dc, cw, content_height, title_bar_height);
+            }
         }
 
         // Blit only the dirty region. GDI would clip a full-window BitBlt
@@ -303,7 +307,7 @@ unsafe fn paint_title_bar(
     cw: i32,
     tb_height: i32,
     caption_buttons_width: i32,
-    buttons: TitleBarButtons,
+    visuals: WindowVisualState,
     dpi: u32,
     hwnd: HWND,
     theme: TitleBarTheme,
@@ -317,7 +321,7 @@ unsafe fn paint_title_bar(
     let (button_left, button_right) =
         geometry::send_back_button_range(cw, caption_buttons_width);
 
-    if buttons.send_back_hovered {
+    if visuals.send_back_hovered {
         fill_solid(
             hdc,
             RECT {
@@ -389,7 +393,7 @@ unsafe fn paint_title_bar(
     );
     SelectObject(hdc, old_font);
 
-    paint_caption_buttons(hdc, cw, tb_height, buttons, dpi, theme, fonts.caption_font);
+    paint_caption_buttons(hdc, cw, tb_height, visuals, dpi, theme, fonts.caption_font);
 }
 
 /// Draws the minimize, maximize/restore, and close buttons at the right of
@@ -400,7 +404,7 @@ unsafe fn paint_caption_buttons(
     hdc: HDC,
     cw: i32,
     tb_height: i32,
-    buttons: TitleBarButtons,
+    visuals: WindowVisualState,
     dpi: u32,
     theme: TitleBarTheme,
     glyph_font: HFONT,
@@ -413,7 +417,7 @@ unsafe fn paint_caption_buttons(
     for button in [CaptionButton::Minimize, CaptionButton::Maximize, CaptionButton::Close] {
         let (left, right) = geometry::caption_button_range(button, cw, dpi);
         let rect = RECT { left, top: 0, right, bottom: tb_height };
-        let hovered = buttons.caption_hovered == Some(button);
+        let hovered = visuals.caption_hovered == Some(button);
 
         if hovered {
             let fill = if button == CaptionButton::Close {
@@ -434,7 +438,7 @@ unsafe fn paint_caption_buttons(
         let code = match button {
             CaptionButton::Minimize => GLYPH_MINIMIZE,
             CaptionButton::Maximize => {
-                if buttons.is_maximized {
+                if visuals.is_maximized {
                     GLYPH_RESTORE
                 } else {
                     GLYPH_MAXIMIZE
@@ -650,4 +654,19 @@ fn title_text_buffer() -> [u16; WINDOW_TITLE_LEN] {
 /// constant if the API is unavailable.
 unsafe fn caption_buttons_width(hwnd: HWND) -> i32 {
     geometry::caption_buttons_width(hwnd)
+}
+
+fn should_paint_grid(is_active: bool) -> bool {
+    is_active
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_paint_grid;
+
+    #[test]
+    fn grid_is_only_painted_for_active_window() {
+        assert!(should_paint_grid(true));
+        assert!(!should_paint_grid(false));
+    }
 }
